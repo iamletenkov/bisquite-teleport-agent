@@ -290,6 +290,17 @@ cmd_render(){
                 if [[ "$uri" =~ ^https://(127\.0\.0\.1|localhost|\[::1\])[:/] || "$uri" =~ ^https://(127\.0\.0\.1|localhost|\[::1\])$ ]]; then
                     echo "      insecure_skip_verify: true"
                 fi
+                # Loopback apps see the public Host, as behind any reverse
+                # proxy. Teleport forwards Host 127.0.0.1:<port> by default,
+                # and apps guarding WebSocket by Origin == Host reject the
+                # browser: Selkies answered 403 "disallowed Origin" until
+                # this (AGX Orin, 2026-09-14). Remote operator apps keep
+                # their Host — it may select a virtual host there.
+                if [[ "$uri" =~ ^https?://(127\.0\.0\.1|localhost|\[::1\])([:/]|$) ]]; then
+                    echo "      rewrite:"
+                    echo "        headers:"
+                    echo "          - \"Host: $name.$node.$host\""
+                fi
                 echo "      labels:"
                 while IFS=$'\t' read -r k v; do echo "        \"$k\": \"$v\""; done <<< "$labels"
                 echo "        \"app\": \"$name\""
