@@ -144,7 +144,7 @@ https на петле публикуется с `insecure_skip_verify`: у code-
 Изменение в `apps.d` подхватывает `bisquite-teleport-apps.path` — reload
 агента без участия человека.
 
-Что объявляет сегодня: `code-server` (с 1.1.0).
+Что объявляет сегодня: `code-server` (с 1.1.0), `selkies` (с 2.1.0).
 
 ## teleport.yaml
 
