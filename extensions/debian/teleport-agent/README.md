@@ -3,6 +3,11 @@
 Агент Teleport на машине: SSH-нода и веб-приложения, без входящих портов —
 агент сам держит обратный туннель к прокси на 443.
 
+> **С 2.0.0 — раскладка 2.** Каталог расширения в госте — `/opt/bisquite/teleport-agent/`
+> (был `/opt/vmsetup/teleport-agent/`); состояние CLI (`rollback` при `join`) переехало из `/var/lib/bisquite-teleport`
+> в `/var/lib/bisquite/teleport`.
+> Нужен bisquite с поддержкой `layout: 2`.
+
 Образ **нейтрален к кластеру**: на сборке ставятся бинарь, CLI и юниты, а
 адрес кластера, `env` и токен задаются на устройстве одной командой. Один
 образ подключается к разным кластерам и `env`, и переезд — та же команда.
@@ -88,7 +93,7 @@ bisquite-teleport status            что настроено и что опуб
    зарегистрирована, недоступный прокси — отказ, прежнее подключение цело.
    Если не была (первая загрузка, сети ещё нет) — предупреждение: агент
    стартует и повторяет попытки сам.
-3. Прежнее состояние — в `/var/lib/bisquite-teleport/rollback`, чистый
+3. Прежнее состояние — в `/var/lib/bisquite/teleport/rollback`, чистый
    `/var/lib/teleport` (кешированная CA прежнего кластера иначе даёт
    `no authorities for hostname`), конфиг, старт.
 4. Ждёт `host_uuid` до 120 с (`BISQUITE_TELEPORT_JOIN_TIMEOUT`). Не дождался,
@@ -172,6 +177,7 @@ https на петле публикуется с `insecure_skip_verify`: у code-
 | `/etc/bisquite/teleport/apps.d/` | 0755 | объявления |
 | `/etc/teleport.yaml` | 0600 | генерируется |
 | `/var/lib/teleport/` | 0750 | регистрация агента |
+| `/var/lib/bisquite/teleport/` | 0700 | `rollback` прежней регистрации на время `join` |
 | `teleport.service` | | агент; включает `join` |
 | `bisquite-teleport-apps.path` | | `apps.d` → reload |
 | `bisquite-teleport-token.path` | | появился `host_uuid` → токен стёрт |

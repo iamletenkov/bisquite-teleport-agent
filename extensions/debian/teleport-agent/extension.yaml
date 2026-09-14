@@ -1,5 +1,6 @@
 name: teleport-agent
-version: 1.0.0
+version: 2.0.0
+layout: 2
 family: deb
 # Teleport публикует tarball для amd64 и arm64; arm64 проверен на AGX Orin.
 arch: [amd64, arm64]
