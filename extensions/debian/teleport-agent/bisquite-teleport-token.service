@@ -1,0 +1,6 @@
+[Unit]
+Description=Scrub the Teleport join token from /etc/bisquite/teleport
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bisquite-teleport scrub-token

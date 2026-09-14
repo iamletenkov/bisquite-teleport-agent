@@ -1,0 +1,580 @@
+#!/usr/bin/env bash
+# bisquite-teleport — подключение машины к Teleport: SSH-нода и веб-приложения.
+#
+#   bisquite-teleport join KEY=VALUE…   зарегистрироваться (первая загрузка, переезд)
+#   bisquite-teleport set KEY=VALUE…    метки и приложения без переподключения
+#   bisquite-teleport leave             отключиться: агент выключен, состояние стёрто
+#   bisquite-teleport status            что настроено, зарегистрирован ли, что опубликовано
+#   bisquite-teleport render            собрать /etc/teleport.yaml (зовёт teleport.service)
+#
+# Ручки — /etc/bisquite/teleport/config (0600):
+#
+#   TELEPORT_PROXY=host[:443]       прокси кластера; только через join
+#   TELEPORT_TOKEN=                 join-токен (node[,app]); стирается после регистрации
+#   TELEPORT_CA_PIN=sha256:…        необязательно: сверка CA кластера
+#   TELEPORT_ENV=                   метка env — по ней smart_role даёт доступ
+#   TELEPORT_NODENAME=              пусто — короткое имя хоста
+#   TELEPORT_LABELS=k=v,k=v         прочие метки ноды (env/app/managed_by нельзя)
+#   TELEPORT_APPS=имя=порт|URI,…    приложения оператора, любой адрес
+#   TELEPORT_APPS_DISABLE=имя,…     не публиковать объявленное
+#   TELEPORT_APPS_DISCOVERY=1       0 — не читать /etc/bisquite/teleport/apps.d
+#
+# Объявления расширений — /etc/bisquite/teleport/apps.d/<имя>.conf, root:root,
+# не шире 0644, ровно два ключа:
+#
+#   NAME=code-server
+#   URI=https://127.0.0.1:9002      только петля
+#
+# ПРАВО ДОСТУПА ЗАДАЁТ ТОЛЬКО ОПЕРАТОР. Роль smart_role стека сверяет метку
+# env с tpEnv пользователя, app — с tpApps. Приложение получает метки ноды
+# плюс app=<имя>; объявление в apps.d меток задать не может, поэтому файл,
+# положенный расширением или кем-то ещё, не открывает приложение чужому env.
+set -uo pipefail
+
+ROOT="${BISQUITE_TELEPORT_ROOT:-}"
+CONF="$ROOT/etc/bisquite/teleport/config"
+APPS_DIR="$ROOT/etc/bisquite/teleport/apps.d"
+YAML="$ROOT/etc/teleport.yaml"
+DATA="$ROOT/var/lib/teleport"
+STATE="$ROOT/var/lib/bisquite-teleport"
+ROLLBACK="$STATE/rollback"
+TELEPORT_BIN="${TELEPORT_BIN:-/usr/local/bin/teleport}"
+JOIN_TIMEOUT="${BISQUITE_TELEPORT_JOIN_TIMEOUT:-120}"
+MANAGED_BY=bisquite-teleport-agent
+
+KEYS=(TELEPORT_PROXY TELEPORT_TOKEN TELEPORT_CA_PIN TELEPORT_ENV TELEPORT_NODENAME
+      TELEPORT_LABELS TELEPORT_APPS TELEPORT_APPS_DISABLE TELEPORT_APPS_DISCOVERY)
+# Keys `set` may change: the cluster itself changes only through `join`,
+# because a new proxy with the old CA cached in DATA never connects.
+SET_KEYS=(TELEPORT_CA_PIN TELEPORT_ENV TELEPORT_NODENAME TELEPORT_LABELS
+          TELEPORT_APPS TELEPORT_APPS_DISABLE TELEPORT_APPS_DISCOVERY)
+
+# Same allow-lists as ldap-admin-api (app/schemas/node.py): every value lands
+# inside double-quoted YAML, so quotes, newlines and `$` must be impossible.
+RE_NODENAME='^[a-z0-9][a-z0-9-]{1,62}$'
+RE_LABEL_KEY='^[a-zA-Z0-9][a-zA-Z0-9_./-]{0,63}$'
+RE_LABEL_VALUE='^[a-zA-Z0-9][a-zA-Z0-9_./ -]{0,127}$'
+RE_APP_NAME='^[a-z0-9][a-z0-9-]{0,62}$'
+RE_PROXY='^[a-z0-9][a-z0-9.-]{0,252}(:[0-9]{1,5})?$'
+RE_TOKEN='^[A-Za-z0-9._-]{8,256}$'
+RE_CA_PIN='^sha256:[0-9a-f]{64}$'
+RE_URI='^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$'
+RE_LOOPBACK_URI='^https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$'
+
+log(){ >&2 echo "bisquite-teleport: $*"; }
+warn(){ log "ВНИМАНИЕ: $*"; }
+die(){ log "ОШИБКА: $*"; exit 1; }
+
+need_root(){ [[ -n "$ROOT" || "$(id -u)" -eq 0 ]] || die "нужен root (sudo)"; }
+has_systemd(){ [[ -z "$ROOT" && -d /run/systemd/system ]]; }
+
+# ---------------------------------------------------------------------------
+# Файл ручек. Не `source`: его пишут firstboot-команды и руки.
+# ---------------------------------------------------------------------------
+declare -A C=()
+
+load_conf(){
+    local k line key val
+    for k in "${KEYS[@]}"; do C[$k]=""; done
+    C[TELEPORT_APPS_DISCOVERY]=1
+    [[ -r "$CONF" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*(TELEPORT_[A-Z_]+)=(.*)$ ]] || continue
+        key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
+        is_key "$key" && C[$key]="$val"
+    done < "$CONF"
+}
+
+is_key(){ local k; for k in "${KEYS[@]}"; do [[ "$1" == "$k" ]] && return 0; done; return 1; }
+is_set_key(){ local k; for k in "${SET_KEYS[@]}"; do [[ "$1" == "$k" ]] && return 0; done; return 1; }
+
+save_conf(){
+    local k tmp
+    install -d -m 0755 "$(dirname "$CONF")"
+    tmp="$(mktemp "$(dirname "$CONF")/.config.XXXXXX")"
+    chmod 0600 "$tmp"
+    {
+        echo "# Подключение к Teleport. Менять командами, они же применяют:"
+        echo "#   sudo bisquite-teleport join TELEPORT_PROXY=… TELEPORT_TOKEN=… TELEPORT_ENV=…"
+        echo "#   sudo bisquite-teleport set TELEPORT_ENV=…"
+        for k in "${KEYS[@]}"; do printf '%s=%s\n' "$k" "${C[$k]}"; done
+    } > "$tmp"
+    mv -f "$tmp" "$CONF"
+}
+
+# Validate one key's value; empty is valid for every optional key.
+validate(){
+    local key="$1" val="$2" item k v
+    local -a items
+    case "$key" in
+        TELEPORT_PROXY) [[ "$val" =~ $RE_PROXY ]] || die "TELEPORT_PROXY='$val': ожидали host[:port]" ;;
+        TELEPORT_TOKEN) [[ -z "$val" || "$val" =~ $RE_TOKEN ]] || die "TELEPORT_TOKEN: недопустимые символы или длина" ;;
+        TELEPORT_CA_PIN) [[ -z "$val" || "$val" =~ $RE_CA_PIN ]] || die "TELEPORT_CA_PIN='$val': ожидали sha256:<64 hex>" ;;
+        TELEPORT_ENV) [[ -z "$val" || "$val" =~ $RE_LABEL_VALUE ]] || die "TELEPORT_ENV='$val': недопустимое значение метки" ;;
+        TELEPORT_NODENAME) [[ -z "$val" || "$val" =~ $RE_NODENAME ]] || die "TELEPORT_NODENAME='$val': ожидали метку DNS [a-z0-9-]" ;;
+        TELEPORT_APPS_DISCOVERY) [[ "$val" == 0 || "$val" == 1 ]] || die "TELEPORT_APPS_DISCOVERY='$val': только 0 или 1" ;;
+        TELEPORT_LABELS)
+            [[ -z "$val" ]] && return 0
+            IFS=',' read -r -a items <<< "$val"
+            for item in "${items[@]}"; do
+                [[ "$item" == *=* ]] || die "TELEPORT_LABELS: '$item' — ожидали ключ=значение"
+                k="${item%%=*}"; v="${item#*=}"
+                [[ "$k" =~ $RE_LABEL_KEY ]] || die "TELEPORT_LABELS: ключ '$k' недопустим"
+                [[ "$v" =~ $RE_LABEL_VALUE ]] || die "TELEPORT_LABELS: значение '$v' недопустимо"
+                case "$k" in env|app|managed_by)
+                    die "TELEPORT_LABELS: ключ '$k' зарезервирован (env задаётся TELEPORT_ENV)" ;;
+                esac
+            done ;;
+        TELEPORT_APPS)
+            [[ -z "$val" ]] && return 0
+            IFS=',' read -r -a items <<< "$val"
+            for item in "${items[@]}"; do
+                [[ "$item" == *=* ]] || die "TELEPORT_APPS: '$item' — ожидали имя=порт или имя=URI"
+                k="${item%%=*}"; v="${item#*=}"
+                [[ "$k" =~ $RE_APP_NAME ]] || die "TELEPORT_APPS: имя '$k' — ожидали метку DNS"
+                [[ "$v" =~ ^[0-9]{1,5}$ || "$v" =~ $RE_URI ]] || die "TELEPORT_APPS: '$v' — ожидали порт или http(s)://хост[:порт][/путь]"
+            done ;;
+        TELEPORT_APPS_DISABLE)
+            [[ -z "$val" ]] && return 0
+            IFS=',' read -r -a items <<< "$val"
+            for item in "${items[@]}"; do
+                [[ "$item" =~ $RE_APP_NAME ]] || die "TELEPORT_APPS_DISABLE: '$item' — ожидали имя приложения"
+            done ;;
+    esac
+}
+
+proxy_with_port(){ [[ "$1" == *:* ]] && echo "$1" || echo "$1:443"; }
+proxy_host(){ echo "${1%%:*}"; }
+
+nodename(){
+    local n="${C[TELEPORT_NODENAME]}"
+    [[ -n "$n" ]] || n="$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+    [[ "$n" =~ $RE_NODENAME ]] || die "имя ноды '$n' (hostname) не метка DNS — задайте TELEPORT_NODENAME"
+    echo "$n"
+}
+
+# ---------------------------------------------------------------------------
+# Приложения: apps.d + TELEPORT_APPS − TELEPORT_APPS_DISABLE
+# Выход: строки "имя<TAB>URI<TAB>источник", пропуски — в stderr.
+# ---------------------------------------------------------------------------
+read_decl(){
+    local f="$1" line key val name="" uri="" owner mode
+    # A symlink would pass the owner check while pointing at anyone's file.
+    if [[ -L "$f" ]]; then
+        warn "пропускаю $f: символическая ссылка"; return 1
+    fi
+    owner="$(stat -c %u "$f")"; mode="$(stat -c %a "$f")"
+    if [[ -z "$ROOT" && "$owner" != 0 ]]; then
+        warn "пропускаю $f: владелец не root"; return 1
+    fi
+    if (( (8#$mode & 8#022) != 0 )); then
+        warn "пропускаю $f: права $mode, запись группе или всем"; return 1
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+        if [[ ! "$line" =~ ^([A-Z]+)=(.*)$ ]]; then
+            warn "пропускаю $f: строка не KEY=VALUE"; return 1
+        fi
+        key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
+        case "$key" in
+            NAME) name="$val" ;;
+            URI) uri="$val" ;;
+            *) warn "пропускаю $f: неизвестный ключ $key (разрешены NAME и URI)"; return 1 ;;
+        esac
+    done < "$f"
+    [[ "$name" =~ $RE_APP_NAME ]] || { warn "пропускаю $f: NAME='$name' не метка DNS"; return 1; }
+    [[ "$uri" =~ $RE_LOOPBACK_URI ]] || { warn "пропускаю $f: URI='$uri' — в apps.d только петля"; return 1; }
+    printf '%s\t%s\t%s\n' "$name" "$uri" "$f"
+}
+
+collect_apps(){
+    local -A uri=() src=() disabled=()
+    local order=() f line name u item
+    local -a items
+    if [[ "${C[TELEPORT_APPS_DISCOVERY]}" == 1 && -d "$APPS_DIR" ]]; then
+        for f in "$APPS_DIR"/*.conf; do
+            [[ -f "$f" ]] || continue
+            line="$(read_decl "$f")" || continue
+            IFS=$'\t' read -r name u _ <<< "$line"
+            if [[ -n "${uri[$name]:-}" ]]; then
+                warn "пропускаю $f: приложение '$name' уже объявлено в ${src[$name]}"; continue
+            fi
+            uri[$name]="$u"; src[$name]="$f"; order+=("$name")
+        done
+    fi
+    if [[ -n "${C[TELEPORT_APPS]}" ]]; then
+        IFS=',' read -r -a items <<< "${C[TELEPORT_APPS]}"
+        for item in "${items[@]}"; do
+            name="${item%%=*}"; u="${item#*=}"
+            [[ "$u" =~ ^[0-9]+$ ]] && u="http://127.0.0.1:$u"
+            # The operator's entry wins over a declaration of the same name.
+            [[ -n "${uri[$name]:-}" ]] || order+=("$name")
+            uri[$name]="$u"; src[$name]="TELEPORT_APPS"
+        done
+    fi
+    if [[ -n "${C[TELEPORT_APPS_DISABLE]}" ]]; then
+        IFS=',' read -r -a items <<< "${C[TELEPORT_APPS_DISABLE]}"
+        for item in "${items[@]}"; do disabled[$item]=1; done
+    fi
+    for name in "${order[@]}"; do
+        [[ -n "${disabled[$name]:-}" ]] && continue
+        printf '%s\t%s\t%s\n' "$name" "${uri[$name]}" "${src[$name]}"
+    done
+}
+
+node_labels(){
+    local -A l=() ; local item k
+    local -a items
+    if [[ -n "${C[TELEPORT_LABELS]}" ]]; then
+        IFS=',' read -r -a items <<< "${C[TELEPORT_LABELS]}"
+        for item in "${items[@]}"; do l[${item%%=*}]="${item#*=}"; done
+    fi
+    l[managed_by]="$MANAGED_BY"
+    # env last and never from TELEPORT_LABELS: it is the access decision.
+    [[ -n "${C[TELEPORT_ENV]}" ]] && l[env]="${C[TELEPORT_ENV]}"
+    for k in $(printf '%s\n' "${!l[@]}" | sort); do printf '%s\t%s\n' "$k" "${l[$k]}"; done
+}
+
+# ---------------------------------------------------------------------------
+# teleport.yaml — форма install.sh ldap-admin-api
+# ---------------------------------------------------------------------------
+cmd_render(){
+    need_root
+    load_conf
+    local k
+    for k in "${KEYS[@]}"; do [[ "$k" == TELEPORT_PROXY && -z "${C[$k]}" ]] || validate "$k" "${C[$k]}"; done
+    [[ -n "${C[TELEPORT_PROXY]}" ]] || die "TELEPORT_PROXY не задан — сначала bisquite-teleport join"
+    local node proxy host apps labels tmp name uri
+    node="$(nodename)"
+    proxy="$(proxy_with_port "${C[TELEPORT_PROXY]}")"
+    host="$(proxy_host "$proxy")"
+    labels="$(node_labels)"
+    apps="$(collect_apps)"
+
+    tmp="$(mktemp "$(dirname "$YAML")/.teleport.yaml.XXXXXX")"
+    chmod 0600 "$tmp"
+    {
+        echo "# Сгенерирован bisquite-teleport render из /etc/bisquite/teleport. Не править:"
+        echo "# перезаписывается на каждом старте teleport.service."
+        echo "version: v3"
+        echo "teleport:"
+        echo "  nodename: \"$node\""
+        echo "  data_dir: /var/lib/teleport"
+        echo "  log:"
+        echo "    output: stderr"
+        echo "    severity: INFO"
+        [[ -n "${C[TELEPORT_CA_PIN]}" ]] && echo "  ca_pin: \"${C[TELEPORT_CA_PIN]}\""
+        echo "  proxy_server: \"$proxy\""
+        if [[ -n "${C[TELEPORT_TOKEN]}" ]]; then
+            echo "  join_params:"
+            echo "    token_name: \"${C[TELEPORT_TOKEN]}\""
+            echo "    method: token"
+        fi
+        echo "ssh_service:"
+        echo "  enabled: yes"
+        # Reached through the proxy's reverse tunnel; nothing needs 3022 from
+        # the network.
+        echo "  listen_addr: 127.0.0.1:3022"
+        echo "  labels:"
+        while IFS=$'\t' read -r k v; do echo "    \"$k\": \"$v\""; done <<< "$labels"
+        if [[ -n "$apps" ]]; then
+            echo "app_service:"
+            echo "  enabled: yes"
+            echo "  apps:"
+            while IFS=$'\t' read -r name uri _; do
+                echo "    - name: \"$name-$node\""
+                echo "      uri: \"$uri\""
+                echo "      public_addr: \"$name.$node.$host\""
+                # Loopback https carries a localhost certificate (mkcert,
+                # self-signed); nobody outside can sit on the loopback path.
+                if [[ "$uri" =~ ^https://(127\.0\.0\.1|localhost|\[::1\])[:/] || "$uri" =~ ^https://(127\.0\.0\.1|localhost|\[::1\])$ ]]; then
+                    echo "      insecure_skip_verify: true"
+                fi
+                echo "      labels:"
+                while IFS=$'\t' read -r k v; do echo "        \"$k\": \"$v\""; done <<< "$labels"
+                echo "        \"app\": \"$name\""
+            done <<< "$apps"
+        else
+            echo "app_service:"
+            echo "  enabled: no"
+        fi
+        echo "auth_service:"
+        echo "  enabled: no"
+        echo "proxy_service:"
+        echo "  enabled: no"
+    } > "$tmp"
+    mv -f "$tmp" "$YAML"
+}
+
+# ---------------------------------------------------------------------------
+# Служба
+# ---------------------------------------------------------------------------
+joined(){ [[ -s "$DATA/host_uuid" ]]; }
+
+# Teleport 18 joins roles separately: a token without App still registers the
+# SSH node, and app_service keeps retrying with this error (seen on AGX Orin
+# 2026-09-14). The identity cannot gain App without a new provision token.
+APP_ROLE_ERROR='token does not allow role App'
+app_role_missing(){
+    has_systemd || return 1
+    local inv log
+    inv="$(systemctl show teleport.service -p InvocationID --value 2>/dev/null)"
+    [[ -n "$inv" ]] || return 1
+    # Into a variable, not `| grep -q`: grep exits on the first match, the
+    # writer gets SIGPIPE, and pipefail turns the match into a failure.
+    log="$(journalctl -u teleport.service "_SYSTEMD_INVOCATION_ID=$inv" --no-pager -o cat 2>/dev/null)"
+    grep -q "$APP_ROLE_ERROR" <<< "$log"
+}
+APP_ROLE_HINT="у токена не было роли App: SSH работает, приложения не опубликованы. Выдайте токен с ролями node,app (в админке — «Разрешить веб-приложения») и выполните join с TELEPORT_FORCE=1"
+agent_active(){ has_systemd && systemctl is-active --quiet teleport.service; }
+
+apply_running(){
+    has_systemd || return 0
+    if agent_active; then
+        cmd_render
+        systemctl reload teleport.service || systemctl restart teleport.service
+    fi
+}
+
+scrub_token(){
+    load_conf
+    [[ -n "${C[TELEPORT_TOKEN]}" ]] || return 0
+    joined || return 0
+    C[TELEPORT_TOKEN]=""
+    save_conf
+    # teleport.yaml carries the token too; rewrite it without restarting —
+    # a joined agent reads its identity from DATA, not from join_params.
+    [[ -n "${C[TELEPORT_PROXY]}" ]] && cmd_render
+    log "агент зарегистрирован — токен стёрт из $CONF и $YAML"
+}
+
+# ---------------------------------------------------------------------------
+# join
+# ---------------------------------------------------------------------------
+version_of_agent(){ "$TELEPORT_BIN" version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | tr -d v; }
+
+# 0 — a is newer than b
+semver_gt(){
+    local -a a b; local i
+    IFS=. read -r -a a <<< "$1"
+    IFS=. read -r -a b <<< "$2"
+    for i in 0 1 2; do
+        (( ${a[i]:-0} > ${b[i]:-0} )) && return 0
+        (( ${a[i]:-0} < ${b[i]:-0} )) && return 1
+    done
+    return 1
+}
+
+# Echo the server version; return 1 if the proxy is unreachable over verified TLS.
+probe_proxy(){
+    local proxy="$1" body
+    body="$(curl -fsS --max-time 15 "https://$proxy/webapi/find" 2>/dev/null)" || return 1
+    grep -oE '"server_version":"[^"]+"' <<< "$body" | head -1 | cut -d'"' -f4
+}
+
+cmd_join(){
+    need_root
+    local -A N=()
+    local pair key val
+    for pair in "$@"; do
+        [[ "$pair" == *=* ]] || die "ожидали KEY=VALUE, получили '$pair'"
+        key="${pair%%=*}"; val="${pair#*=}"
+        is_key "$key" || [[ "$key" == TELEPORT_FORCE ]] || die "неизвестная ручка '$key'"
+        N[$key]="$val"
+    done
+    if [[ "${N[TELEPORT_TOKEN]:-}" == - ]]; then
+        IFS= read -r val || true
+        N[TELEPORT_TOKEN]="$val"
+    fi
+    [[ -n "${N[TELEPORT_PROXY]:-}" ]] || die "нужен TELEPORT_PROXY=host[:port]"
+    [[ -n "${N[TELEPORT_TOKEN]:-}" ]] || die "нужен TELEPORT_TOKEN (или TELEPORT_TOKEN=- со stdin)"
+    for key in "${!N[@]}"; do [[ "$key" == TELEPORT_FORCE ]] || validate "$key" "${N[$key]}"; done
+    local force="${N[TELEPORT_FORCE]:-0}"; unset 'N[TELEPORT_FORCE]'
+    N[TELEPORT_PROXY]="$(proxy_with_port "${N[TELEPORT_PROXY]}")"
+
+    load_conf
+    local old_proxy="${C[TELEPORT_PROXY]}"
+    [[ -n "$old_proxy" ]] && old_proxy="$(proxy_with_port "$old_proxy")"
+
+    # 1. Idempotent: a rerun of runcmd (cloned card, cloud-init clean) must
+    #    not wipe a working identity with the stale token from the seed.
+    if joined && [[ "$old_proxy" == "${N[TELEPORT_PROXY]}" && "$force" != 1 ]]; then
+        log "уже зарегистрирован в ${N[TELEPORT_PROXY]} — переподключение не нужно (TELEPORT_FORCE=1 — принудительно)"
+        for key in "${!N[@]}"; do
+            [[ "$key" == TELEPORT_PROXY || "$key" == TELEPORT_TOKEN ]] && continue
+            C[$key]="${N[$key]}"
+        done
+        save_conf
+        apply_running
+        return 0
+    fi
+    [[ -n "${C[TELEPORT_ENV]}${N[TELEPORT_ENV]:-}" ]] || \
+        warn "TELEPORT_ENV не задан: ноду и приложения увидят только роли access/editor"
+
+    # 2. Preflight before touching anything.
+    local was_joined=0 server agent
+    joined && was_joined=1
+    agent="$(version_of_agent)"
+    [[ -n "$agent" ]] || die "$TELEPORT_BIN не отвечает на version — расширение не установлено?"
+    if server="$(probe_proxy "${N[TELEPORT_PROXY]}")"; then
+        if [[ -n "$server" ]]; then
+            if semver_gt "$agent" "$server"; then
+                die "агент $agent новее кластера $server — Teleport такую связку не поддерживает"
+            fi
+            if (( ${server%%.*} - ${agent%%.*} > 1 )); then
+                die "агент $agent старше кластера $server больше чем на мажор"
+            fi
+            log "прокси ${N[TELEPORT_PROXY]} отвечает, кластер $server, агент $agent"
+        fi
+    elif (( was_joined )); then
+        die "прокси ${N[TELEPORT_PROXY]} недоступен по https — рабочую регистрацию не трогаю"
+    else
+        warn "прокси ${N[TELEPORT_PROXY]} пока недоступен — агент будет повторять попытки"
+    fi
+
+    # 3. Keep the previous state for a rollback.
+    if has_systemd; then systemctl stop teleport.service 2>/dev/null || true; fi
+    rm -r -f -- "$ROLLBACK"
+    install -d -m 0700 "$STATE" "$ROLLBACK" "$ROLLBACK/data"
+    [[ -f "$CONF" ]] && cp -a "$CONF" "$ROLLBACK/config"
+    [[ -f "$YAML" ]] && cp -a "$YAML" "$ROLLBACK/teleport.yaml"
+    if [[ -d "$DATA" ]]; then
+        find "$DATA" -mindepth 1 -maxdepth 1 -exec mv -t "$ROLLBACK/data" -- {} +
+    fi
+    install -d -m 0750 "$DATA"
+
+    # A new cluster invalidates the old pin unless a new one came with it.
+    if [[ "$old_proxy" != "${N[TELEPORT_PROXY]}" && -z "${N[TELEPORT_CA_PIN]+x}" ]]; then
+        C[TELEPORT_CA_PIN]=""
+    fi
+    for key in "${!N[@]}"; do C[$key]="${N[$key]}"; done
+    save_conf
+    cmd_render
+
+    if ! has_systemd; then
+        log "systemd не запущен — конфиг записан, агент стартует при загрузке"
+        return 0
+    fi
+    systemctl enable teleport.service >/dev/null 2>&1
+    systemctl start teleport.service
+
+    # 4. Wait for the identity.
+    local waited=0
+    log "жду регистрации (до ${JOIN_TIMEOUT} с)…"
+    while (( waited < JOIN_TIMEOUT )); do
+        if joined; then
+            rm -r -f -- "$ROLLBACK"
+            scrub_token
+            log "нода $(nodename) зарегистрирована в ${C[TELEPORT_PROXY]}"
+            # Apps join after the node; give app_service a moment to fail.
+            if [[ -n "$(collect_apps 2>/dev/null)" ]]; then
+                sleep 15
+                if app_role_missing; then warn "$APP_ROLE_HINT"; return 2; fi
+            fi
+            return 0
+        fi
+        sleep 2; waited=$((waited + 2))
+    done
+
+    # 5. Timed out.
+    if [[ -s "$ROLLBACK/data/host_uuid" ]]; then
+        warn "регистрация не подтвердилась за ${JOIN_TIMEOUT} с — возвращаю прежнее подключение"
+        systemctl stop teleport.service
+        find "$DATA" -mindepth 1 -maxdepth 1 -exec rm -r -f -- {} +
+        find "$ROLLBACK/data" -mindepth 1 -maxdepth 1 -exec mv -t "$DATA" -- {} +
+        [[ -f "$ROLLBACK/config" ]] && cp -a "$ROLLBACK/config" "$CONF"
+        [[ -f "$ROLLBACK/teleport.yaml" ]] && cp -a "$ROLLBACK/teleport.yaml" "$YAML"
+        systemctl start teleport.service
+        rm -r -f -- "$ROLLBACK"
+        die "join не удался, прежняя регистрация восстановлена — journalctl -u teleport"
+    fi
+    rm -r -f -- "$ROLLBACK"
+    die "регистрация не подтвердилась за ${JOIN_TIMEOUT} с; агент продолжает попытки — journalctl -u teleport -f"
+}
+
+# ---------------------------------------------------------------------------
+cmd_set(){
+    need_root
+    (( $# )) || die "ожидали KEY=VALUE…"
+    load_conf
+    local pair key val
+    for pair in "$@"; do
+        [[ "$pair" == *=* ]] || die "ожидали KEY=VALUE, получили '$pair'"
+        key="${pair%%=*}"; val="${pair#*=}"
+        if ! is_set_key "$key"; then
+            is_key "$key" && die "$key меняется только через join (новый кластер — новая регистрация)"
+            die "неизвестная ручка '$key'"
+        fi
+        validate "$key" "$val"
+        C[$key]="$val"
+    done
+    save_conf
+    if [[ -n "${C[TELEPORT_PROXY]}" ]]; then
+        apply_running
+        if agent_active; then log "применено к работающему агенту"; else log "записано; применится при старте агента"; fi
+    else
+        log "записано; кластер не задан — bisquite-teleport join"
+    fi
+}
+
+cmd_leave(){
+    need_root
+    if has_systemd; then
+        systemctl disable --now teleport.service >/dev/null 2>&1 || true
+    fi
+    [[ -d "$DATA" ]] && find "$DATA" -mindepth 1 -maxdepth 1 -exec rm -r -f -- {} +
+    rm -f "$YAML"
+    rm -r -f -- "$ROLLBACK"
+    load_conf
+    C[TELEPORT_PROXY]=""; C[TELEPORT_TOKEN]=""; C[TELEPORT_CA_PIN]=""
+    save_conf
+    log "отключено: агент выключен, состояние стёрто. Запись ноды в кластере исчезнет по истечении heartbeat или удаляется в админке."
+}
+
+cmd_status(){
+    load_conf
+    local k v
+    echo "Ручки ($CONF):"
+    for k in "${KEYS[@]}"; do
+        v="${C[$k]}"
+        [[ "$k" == TELEPORT_TOKEN && -n "$v" ]] && v="<задан>"
+        printf '  %-24s %s\n' "$k" "${v:-—}"
+    done
+    echo
+    echo "Агент: $("$TELEPORT_BIN" version 2>/dev/null | head -1 || echo 'не установлен')"
+    if has_systemd; then
+        echo "Служба teleport: $(systemctl is-active teleport.service 2>/dev/null), $(systemctl is-enabled teleport.service 2>/dev/null)"
+    fi
+    if joined; then echo "Регистрация: есть (host_uuid $(cat "$DATA/host_uuid"))"; else echo "Регистрация: нет"; fi
+    app_role_missing && echo "ВНИМАНИЕ: $APP_ROLE_HINT"
+    if [[ -n "${C[TELEPORT_PROXY]}" ]]; then
+        local host node; host="$(proxy_host "$(proxy_with_port "${C[TELEPORT_PROXY]}")")"
+        node="$(nodename 2>/dev/null || echo '?')"
+        echo "Нода: $node, метки: $(node_labels | tr '\t\n' '= ' )"
+    fi
+    echo
+    echo "Приложения:"
+    local out; out="$(collect_apps)"
+    if [[ -z "$out" ]]; then
+        echo "  —"
+    else
+        while IFS=$'\t' read -r k v src; do
+            if [[ -n "${host:-}" ]]; then
+                printf '  %-16s %-32s https://%s.%s.%s  (%s)\n' "$k" "$v" "$k" "$node" "$host" "$src"
+            else
+                printf '  %-16s %-32s (%s)\n' "$k" "$v" "$src"
+            fi
+        done <<< "$out"
+    fi
+}
+
+case "${1:-}" in
+    join) shift; cmd_join "$@" ;;
+    set) shift; cmd_set "$@" ;;
+    leave) cmd_leave ;;
+    status) cmd_status ;;
+    render) cmd_render ;;
+    scrub-token) need_root; scrub_token ;;
+    -h|--help|help|"") sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "неизвестная команда '$1' (join|set|leave|status|render)" ;;
+esac

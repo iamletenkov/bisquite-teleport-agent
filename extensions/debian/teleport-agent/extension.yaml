@@ -1,0 +1,13 @@
+name: teleport-agent
+version: 1.0.0
+family: deb
+# Teleport публикует tarball для amd64 и arm64; arm64 проверен на AGX Orin.
+arch: [amd64, arm64]
+# Только build: бинарь, CLI и юниты кладутся в образ. Кластер, env и токен —
+# на устройстве командой `bisquite-teleport join` из firstboot-commands
+# манифеста записи: образ нейтрален к кластеру, первая загрузка расширением
+# в сеть не ходит (ходит сам агент, когда его подключили).
+phase: build
+provides: [teleport-node]
+requires: []
+conflicts: []
