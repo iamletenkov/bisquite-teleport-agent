@@ -1,5 +1,5 @@
 name: teleport-agent
-version: 2.1.0
+version: 2.1.1
 layout: 2
 # 2.1.0: ручки — домен teleport библиотеки bisquite-conf (схема knobs);
 #        bisquite-teleport ставится ссылкой, свои разбор и проверки удалены.

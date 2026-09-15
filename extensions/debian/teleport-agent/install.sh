@@ -68,7 +68,10 @@ else
         log_info "sha256 взят с cdn.teleport.dev"
     fi
     log_info "скачиваю $URL"
-    curl -fL --retry 5 --retry-delay 5 -o "$WORK/$FILE" "$URL" || { log_error "tarball не скачался"; exit 1; }
+    # Stalls become retries instead of an endless wait (see selkies/install.sh).
+    curl -fL --retry 5 --retry-delay 5 \
+        --connect-timeout 30 --speed-limit 10240 --speed-time 60 \
+        -o "$WORK/$FILE" "$URL" || { log_error "tarball не скачался"; exit 1; }
     echo "${TELEPORT_SHA256}  $WORK/$FILE" | sha256sum -c --quiet - || { log_error "sha256 не совпал"; exit 1; }
     # Only the agent: tsh, tctl, tbot and teleport-update are ~370 MB more and
     # a node needs none of them.
