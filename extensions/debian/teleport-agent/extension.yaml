@@ -1,6 +1,8 @@
 name: teleport-agent
-version: 2.0.0
+version: 2.1.0
 layout: 2
+# 2.1.0: ручки — домен teleport библиотеки bisquite-conf (схема knobs);
+#        bisquite-teleport ставится ссылкой, свои разбор и проверки удалены.
 family: deb
 # Teleport публикует tarball для amd64 и arm64; arm64 проверен на AGX Orin.
 arch: [amd64, arm64]

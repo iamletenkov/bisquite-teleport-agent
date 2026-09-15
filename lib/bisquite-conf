@@ -43,7 +43,7 @@ declare -gA _CONF_VAL=() _CONF_SRC=()
 declare -ga _CONF_PEND_KEYS=()
 declare -gA _CONF_PEND=() _CONF_PEND_NOTE=()
 declare -g _CONF_WHY="" _CONF_KT="" _CONF_KD="" _CONF_KDESC=""
-declare -g _CONF_T_RO=0 _CONF_T_SECRET="" _CONF_T_BASE=""
+declare -g _CONF_T_RO=0 _CONF_T_SECRET="" _CONF_T_BASE="" _CONF_T_OPT=0
 
 _conf_err(){ >&2 printf 'bisquite-conf: %s\n' "$*"; }
 
@@ -61,9 +61,12 @@ _conf_domain_ok(){
 # ---------------------------------------------------------------------------
 # Types
 #
-#   TYPE   := [ro:] BASE | [ro:] secret | [ro:] secret:hook | [ro:] secret:BASE
+#   TYPE   := [ro:] ( BASE | secret | secret:hook | secret:BASE ) [?]
 #   BASE   := bool | int | port | host | path | str | enum:a,b | re:ERE | list:BASE
 #
+# ?:       the key accepts an empty value even with a real default (flags that
+#          may be cleared). Without it only a key with an empty default does.
+#          A trailing `?` is always this marker: an ERE ends in `$`, not `?`.
 # ro:      `bisquite-conf set` refuses the key; the owner writes it through
 #          conf_set --allow-ro (bisquite-teleport join, a secret hook).
 # secret:  the value is masked in `show`; the file gets 0600.
@@ -72,8 +75,9 @@ _conf_domain_ok(){
 # ---------------------------------------------------------------------------
 _conf_type_parse(){
     local t="$1"
-    _CONF_T_RO=0; _CONF_T_SECRET=""; _CONF_T_BASE=""
+    _CONF_T_RO=0; _CONF_T_SECRET=""; _CONF_T_BASE=""; _CONF_T_OPT=0
     if [[ "$t" == ro:* ]]; then _CONF_T_RO=1; t="${t#ro:}"; fi
+    if [[ "$t" == *\? ]]; then _CONF_T_OPT=1; t="${t%\?}"; fi
     case "$t" in
         secret) _CONF_T_SECRET=1; _CONF_T_BASE=secret ;;
         secret:hook) _CONF_T_SECRET=hook ;;
@@ -112,6 +116,11 @@ _conf_base_check(){
             [[ "$v" != *$'\n'* && "$v" != *$'\r'* ]] || { _CONF_WHY="перевод строки в значении"; return 1; } ;;
         list:*)
             [[ -z "$v" ]] && return 0
+            # `read` below sees the first line only: check the whole value first.
+            if [[ "$v" == *[[:cntrl:]]* || "$v" == *'$'* || "$v" == *'`'* ]]; then
+                # shellcheck disable=SC2016  # literal characters, not expansions
+                _CONF_WHY='управляющие символы, `$` и обратные кавычки недопустимы'; return 1
+            fi
             [[ "$v" != ,* && "$v" != *, && "$v" != *,,* ]] || { _CONF_WHY="пустой элемент списка"; return 1; }
             IFS=, read -r -a items <<< "$v"
             for item in "${items[@]}"; do
@@ -159,8 +168,9 @@ _conf_base_check(){
 #   X_ADDR   "re:^[a-z ]+$"       —           поле в кавычках может содержать пробелы
 #   X_*      str                  —           шаблон: любой ключ с префиксом X_
 #
-# `—` is the empty default. A key with an empty default accepts an empty
-# value; a key with a real default does not (X_PORT= would break the service).
+# `—` is the empty default. A key with an empty default (or a `?` type)
+# accepts an empty value; any other key does not (X_PORT= would break the
+# service).
 # ---------------------------------------------------------------------------
 _conf_ltrim(){ local s="$1"; printf '%s' "${s#"${s%%[![:space:]]*}"}"; }
 
@@ -273,7 +283,7 @@ _conf_check_pair(){
         return 1
     fi
     if [[ -z "$val" ]]; then
-        [[ -z "$_CONF_KD" ]] && return 0
+        [[ -z "$_CONF_KD" ]] || (( _CONF_T_OPT )) && return 0
         _conf_err "$domain: $key: пустое значение недопустимо (умолчание $_CONF_KD)"
         return 1
     fi
@@ -577,7 +587,16 @@ conf_set(){
         if [[ "$val" == - ]]; then
             if (( stdin_used )); then _conf_err "$domain: со stdin читается только одно значение"; rc=1; continue; fi
             stdin_used=1
-            IFS= read -r val || [[ -n "$val" ]] || val=""
+            # Empty stdin is a refusal, not an empty value: for a secret:hook key
+            # empty means "remove the password", and `echo "$UNSET" | …` or a
+            # closed pipe must never open a VNC server. Clear with `KEY=`.
+            val=""
+            if ! IFS= read -r val && [[ -z "$val" ]]; then
+                _conf_err "$domain: $key=-: stdin пуст — значение не прочитано (очистить ключ: $key=)"; rc=1; continue
+            fi
+            if [[ -z "$val" ]]; then
+                _conf_err "$domain: $key=-: со stdin пришла пустая строка (очистить ключ: $key=)"; rc=1; continue
+            fi
         fi
         _conf_check_pair "$domain" "$key" "$val" "$allow_ro" || { rc=1; continue; }
         _conf_type_parse "$_CONF_KT"
@@ -724,11 +743,11 @@ _conf_new_file(){
 # commas). Mapped values go through conf_set; on success the YAML is removed,
 # on refusal it stays and install.sh fails.
 _conf_migrate_yaml(){
-    local domain="$1" map="$2" yaml item line key val section="" name
+    local domain="$1" map="$2" yaml item line key val section="" listkey="" name k
     yaml="$(_conf_dir "$domain")/config.yaml"
     [[ -f "$yaml" ]] || return 0
-    local -A to=()
-    local -a pairs=() items=()
+    local -A to=() got=()
+    local -a pairs=() items=() order=() unmapped=()
     IFS=, read -r -a items <<< "$map"
     for item in "${items[@]}"; do to[${item%%=*}]="${item#*=}"; done
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -738,20 +757,39 @@ _conf_migrate_yaml(){
             key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"; section="$key"
         elif [[ "$line" =~ ^[[:space:]]+([A-Za-z_][A-Za-z0-9_]*):[[:space:]]*(.*)$ ]]; then
             key="$section.${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
-        else
+        elif [[ -n "$listkey" && "$line" =~ ^[[:space:]]*-[[:space:]]+(.*)$ ]]; then
+            # A block sequence item of the last key that had no inline value.
+            val="$(_conf_yaml_scalar "${BASH_REMATCH[1]}")"
+            [[ -n "$val" ]] && got[$listkey]+="${got[$listkey]:+,}$val"
             continue
+        else
+            _conf_err "$domain: $yaml: строка не разобрана — «$line»; файл не перенесён"
+            return 1
         fi
         val="$(_conf_yaml_scalar "$val")"
-        [[ -z "$val" ]] && continue
-        name="${to[$key]:-}"
-        [[ -n "$name" ]] || continue
-        pairs+=("$name=$val")
+        [[ -n "${got[$key]+x}" ]] || order+=("$key")
+        got[$key]="$val"
+        listkey=""
+        [[ -z "$val" ]] && listkey="$key"
     done < "$yaml"
+    for k in "${order[@]}"; do
+        [[ -n "${got[$k]}" ]] || continue
+        name="${to[$k]:-}"
+        if [[ -z "$name" ]]; then
+            unmapped+=("$k"); continue
+        fi
+        pairs+=("$name=${got[$k]}")
+    done
     if (( ${#pairs[@]} )); then
         if ! conf_set "$domain" "${pairs[@]}" < /dev/null; then
             _conf_err "$domain: $yaml не перенесён — исправьте значения и повторите установку"
             return 1
         fi
+    fi
+    if (( ${#unmapped[@]} )); then
+        # Keys that are not knobs of the domain (section headers aside) — say
+        # which values stay behind rather than drop them silently.
+        _conf_err "$domain: из $yaml не переносятся (не ручки домена): ${unmapped[*]}"
     fi
     rm -f "$yaml"
     >&2 printf 'bisquite-conf: %s: %s перенесён в %s (%d знач.) и удалён\n' \
@@ -778,6 +816,7 @@ _conf_yaml_scalar(){
     if [[ "$v" == \"* ]]; then
         v="${v:1}"; printf '%s' "${v%%\"*}"; return
     fi
+    [[ "$v" == \#* ]] && v=""
     v="${v%%[[:space:]]#*}"
     v="${v%"${v##*[![:space:]]}"}"
     [[ "$v" == "~" || "$v" == null ]] && v=""
