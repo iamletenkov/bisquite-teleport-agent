@@ -8,6 +8,11 @@
 > в `/var/lib/bisquite/teleport`.
 > Нужен bisquite с поддержкой `layout: 2`.
 
+> **С 2.1.0 — библиотека настроек.** `/etc/bisquite/teleport/config` — домен
+> `teleport` библиотеки `bisquite-conf` (схема `knobs`): `bisquite-teleport`
+> больше не держит свои разбор и проверки значений, `bisquite-conf set teleport …`
+> и `bisquite-teleport set …` — одна и та же проверка. CLI ставится ссылкой.
+
 Образ **нейтрален к кластеру**: на сборке ставятся бинарь, CLI и юниты, а
 адрес кластера, `env` и токен задаются на устройстве одной командой. Один
 образ подключается к разным кластерам и `env`, и переезд — та же команда.
@@ -104,7 +109,16 @@ bisquite-teleport status            что настроено и что опуб
 `TELEPORT_ENV`, `TELEPORT_NODENAME`, `TELEPORT_LABELS`, `TELEPORT_APPS`,
 `TELEPORT_APPS_DISABLE`, `TELEPORT_APPS_DISCOVERY`, `TELEPORT_CA_PIN`.
 Применяет к работающему агенту через reload (HUP — мягкий перезапуск Teleport,
-открытые SSH-сессии живут). `TELEPORT_PROXY` и `TELEPORT_TOKEN` — только `join`.
+открытые SSH-сессии живут). `TELEPORT_PROXY` и `TELEPORT_TOKEN` — только `join`:
+в схеме они `ro:`, и `set` отказывает текстом из неё.
+
+`bisquite-teleport set` — то же, что `sudo bisquite-conf set --apply teleport …`:
+значения проверяет схема `knobs` (шаблоны те же, что у ldap-admin-api: каждое
+значение ложится в YAML в двойных кавычках), пишет библиотека, а хук
+`knobs.apply` (`bisquite-teleport apply`) собирает `teleport.yaml` и ставит
+reload в очередь без ожидания — `set` бывает и внутри `cloud-final`.
+Зарезервированные ключи меток (`env`, `app`, `managed_by`) проверяет сам
+`bisquite-teleport` — в `set`, `join` и `render`.
 
 ### leave
 
@@ -154,7 +168,9 @@ https на петле публикуется с `insecure_skip_verify`: у code-
 ## teleport.yaml
 
 `/etc/teleport.yaml` генерируется на каждом старте службы из
-`/etc/bisquite/teleport`, руками не правится:
+`/etc/bisquite/teleport`, руками не правится. Перед генерацией `render` сверяет
+весь файл ручек со схемой: правка руками с кавычкой или `$` — отказ старта, а
+не испорченный YAML.
 
 - `nodename` — `TELEPORT_NODENAME` или имя хоста;
 - `ssh_service.listen_addr: 127.0.0.1:3022` — наружу порт не нужен, SSH идёт
@@ -172,8 +188,9 @@ https на петле публикуется с `insecure_skip_verify`: у code-
 | Путь | Права | Что |
 |---|---|---|
 | `/usr/local/bin/teleport` | 0755 | агент |
-| `/usr/local/sbin/bisquite-teleport` | 0755 | CLI |
-| `/etc/bisquite/teleport/config` | 0600 | ручки |
+| `/usr/local/sbin/bisquite-teleport` | ссылка | CLI → `/opt/bisquite/teleport-agent/bisquite-teleport` |
+| `/etc/bisquite/teleport/config` | 0600 | ручки (домен `teleport`, `bisquite-conf show teleport`) |
+| `/opt/bisquite/knobs/teleport{,.apply}` | ссылки | схема и хук применения |
 | `/etc/bisquite/teleport/apps.d/` | 0755 | объявления |
 | `/etc/teleport.yaml` | 0600 | генерируется |
 | `/var/lib/teleport/` | 0750 | регистрация агента |
