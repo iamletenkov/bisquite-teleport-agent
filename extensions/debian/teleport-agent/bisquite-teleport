@@ -20,17 +20,20 @@
 #   TELEPORT_LABELS=k=v,k=v         прочие метки ноды (env/app/managed_by нельзя)
 #   TELEPORT_APPS=имя=порт|URI,…    приложения оператора, любой адрес
 #   TELEPORT_APPS_DISABLE=имя,…     не публиковать объявленное
+#   TELEPORT_APPS_ICONS=имя=икон,…  иконка приложения в веб-морде прокси
 #   TELEPORT_APPS_DISCOVERY=1       0 — не читать /etc/bisquite/teleport/apps.d
 #
 # Объявления расширений — /etc/bisquite/teleport/apps.d/<имя>.conf, root:root,
-# не шире 0644, ровно два ключа:
+# не шире 0644, два обязательных ключа и один необязательный:
 #
 #   NAME=code-server
 #   URI=https://127.0.0.1:9002      только петля
+#   ICON=mcpVscode                  имя иконки в веб-морде прокси
 #
 # ПРАВО ДОСТУПА ЗАДАЁТ ТОЛЬКО ОПЕРАТОР. Роль smart_role стека сверяет метку
 # env с tpEnv пользователя, app — с tpApps. Приложение получает метки ноды
-# плюс app=<имя>; объявление в apps.d меток задать не может, поэтому файл,
+# плюс app=<имя>; единственная метка, которую объявление задаёт само, —
+# teleport.icon, и решением о доступе она не является. Поэтому файл,
 # положенный расширением или кем-то ещё, не открывает приложение чужому env.
 set -uo pipefail
 
@@ -56,6 +59,12 @@ MANAGED_BY=bisquite-teleport-agent
 # is not a knob: the hostname fallback of the node name and apps.d files.
 RE_NODENAME='^[a-z0-9][a-z0-9-]{1,62}$'
 RE_APP_NAME='^[a-z0-9][a-z0-9-]{0,62}$'
+# The icon name is a key of the proxy's compiled-in icon set, which this
+# script cannot see; only the alphabet of real keys is checked (there are
+# `apollo.io`, `mcpVscode`, `1password` among them). An unknown name is not
+# an error for the proxy — it falls back to guessing by app name, so a typo
+# is silent. See README.
+RE_APP_ICON='^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
 RE_LOOPBACK_URI='^https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$'
 
 log(){ >&2 echo "bisquite-teleport: $*"; }
@@ -93,8 +102,14 @@ check_labels(){
     [[ -n "$val" ]] || return 0
     IFS=',' read -r -a items <<< "$val"
     for item in "${items[@]}"; do
-        case "${item%%=*}" in env|app|managed_by)
-            die "TELEPORT_LABELS: ключ '${item%%=*}' зарезервирован (env задаётся TELEPORT_ENV)" ;;
+        case "${item%%=*}" in
+            env|app|managed_by)
+                die "TELEPORT_LABELS: ключ '${item%%=*}' зарезервирован (env задаётся TELEPORT_ENV)" ;;
+            # A node-wide icon label would land in the same YAML map as the
+            # app's own one — a duplicate key, and teleport.yaml would not
+            # parse at all.
+            teleport.icon)
+                die "TELEPORT_LABELS: ключ 'teleport.icon' зарезервирован — иконка задаётся ICON= в apps.d или ручкой TELEPORT_APPS_ICONS" ;;
         esac
     done
 }
@@ -114,7 +129,7 @@ nodename(){
 # Выход: строки "имя<TAB>URI<TAB>источник", пропуски — в stderr.
 # ---------------------------------------------------------------------------
 read_decl(){
-    local f="$1" line key val name="" uri="" owner mode
+    local f="$1" line key val name="" uri="" icon="" owner mode
     # A symlink would pass the owner check while pointing at anyone's file.
     if [[ -L "$f" ]]; then
         warn "пропускаю $f: символическая ссылка"; return 1
@@ -135,27 +150,32 @@ read_decl(){
         case "$key" in
             NAME) name="$val" ;;
             URI) uri="$val" ;;
-            *) warn "пропускаю $f: неизвестный ключ $key (разрешены NAME и URI)"; return 1 ;;
+            ICON) icon="$val" ;;
+            *) warn "пропускаю $f: неизвестный ключ $key (разрешены NAME, URI и ICON)"; return 1 ;;
         esac
     done < "$f"
     [[ "$name" =~ $RE_APP_NAME ]] || { warn "пропускаю $f: NAME='$name' не метка DNS"; return 1; }
     [[ "$uri" =~ $RE_LOOPBACK_URI ]] || { warn "пропускаю $f: URI='$uri' — в apps.d только петля"; return 1; }
-    printf '%s\t%s\t%s\n' "$name" "$uri" "$f"
+    if [[ -n "$icon" && ! "$icon" =~ $RE_APP_ICON ]]; then
+        warn "пропускаю $f: ICON='$icon' не имя иконки"; return 1
+    fi
+    # The icon goes last: an empty field between two tabs collapses on read.
+    printf '%s\t%s\t%s\t%s\n' "$name" "$uri" "$f" "$icon"
 }
 
 collect_apps(){
-    local -A uri=() src=() disabled=()
-    local order=() f line name u item
+    local -A uri=() src=() disabled=() icon=()
+    local order=() f line name u ic item
     local -a items
     if [[ "${C[TELEPORT_APPS_DISCOVERY]}" == 1 && -d "$APPS_DIR" ]]; then
         for f in "$APPS_DIR"/*.conf; do
             [[ -f "$f" ]] || continue
             line="$(read_decl "$f")" || continue
-            IFS=$'\t' read -r name u _ <<< "$line"
+            IFS=$'\t' read -r name u _ ic <<< "$line"
             if [[ -n "${uri[$name]:-}" ]]; then
                 warn "пропускаю $f: приложение '$name' уже объявлено в ${src[$name]}"; continue
             fi
-            uri[$name]="$u"; src[$name]="$f"; order+=("$name")
+            uri[$name]="$u"; src[$name]="$f"; icon[$name]="$ic"; order+=("$name")
         done
     fi
     if [[ -n "${C[TELEPORT_APPS]}" ]]; then
@@ -168,13 +188,19 @@ collect_apps(){
             uri[$name]="$u"; src[$name]="TELEPORT_APPS"
         done
     fi
+    if [[ -n "${C[TELEPORT_APPS_ICONS]}" ]]; then
+        IFS=',' read -r -a items <<< "${C[TELEPORT_APPS_ICONS]}"
+        # The operator's icon wins over the declaration's, the same way the
+        # operator's URI does. A name that nothing publishes is ignored.
+        for item in "${items[@]}"; do icon[${item%%=*}]="${item#*=}"; done
+    fi
     if [[ -n "${C[TELEPORT_APPS_DISABLE]}" ]]; then
         IFS=',' read -r -a items <<< "${C[TELEPORT_APPS_DISABLE]}"
         for item in "${items[@]}"; do disabled[$item]=1; done
     fi
     for name in "${order[@]}"; do
         [[ -n "${disabled[$name]:-}" ]] && continue
-        printf '%s\t%s\t%s\n' "$name" "${uri[$name]}" "${src[$name]}"
+        printf '%s\t%s\t%s\t%s\n' "$name" "${uri[$name]}" "${src[$name]}" "${icon[$name]:-}"
     done
 }
 
@@ -202,7 +228,7 @@ cmd_render(){
     conf_check teleport || die "в $CONF неверные значения — bisquite-conf show teleport"
     check_labels "${C[TELEPORT_LABELS]}"
     [[ -n "${C[TELEPORT_PROXY]}" ]] || die "TELEPORT_PROXY не задан — сначала bisquite-teleport join"
-    local node proxy host apps labels tmp name uri
+    local node proxy host apps labels tmp name uri icon
     node="$(nodename)"
     proxy="$(proxy_with_port "${C[TELEPORT_PROXY]}")"
     host="$(proxy_host "$proxy")"
@@ -239,7 +265,7 @@ cmd_render(){
             echo "app_service:"
             echo "  enabled: yes"
             echo "  apps:"
-            while IFS=$'\t' read -r name uri _; do
+            while IFS=$'\t' read -r name uri _ icon; do
                 echo "    - name: \"$name-$node\""
                 echo "      uri: \"$uri\""
                 echo "      public_addr: \"$name.$node.$host\""
@@ -262,6 +288,9 @@ cmd_render(){
                 echo "      labels:"
                 while IFS=$'\t' read -r k v; do echo "        \"$k\": \"$v\""; done <<< "$labels"
                 echo "        \"app\": \"$name\""
+                # No icon — no label: the proxy then guesses by app name,
+                # which is what an app named `grafana` wants.
+                [[ -n "$icon" ]] && echo "        \"teleport.icon\": \"$icon\""
             done <<< "$apps"
         else
             echo "app_service:"
@@ -536,11 +565,12 @@ cmd_status(){
     fi
     echo
     echo "Приложения:"
-    local out; out="$(collect_apps)"
+    local out k v src icon; out="$(collect_apps)"
     if [[ -z "$out" ]]; then
         echo "  —"
     else
-        while IFS=$'\t' read -r k v src; do
+        while IFS=$'\t' read -r k v src icon; do
+            [[ -n "$icon" ]] && src="$src, иконка $icon"
             if [[ -n "${host:-}" ]]; then
                 printf '  %-16s %-32s https://%s.%s.%s  (%s)\n' "$k" "$v" "$k" "$node" "$host" "$src"
             else
@@ -558,6 +588,6 @@ case "${1:-}" in
     render) cmd_render ;;
     apply) shift; cmd_apply "$@" ;;
     scrub-token) need_root; scrub_token ;;
-    -h|--help|help|"") sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//' ;;
+    -h|--help|help|"") sed -n '2,${/^#/!q; s/^# \{0,1\}//; p}' "$0" ;;
     *) die "неизвестная команда '$1' (join|set|leave|status|render|apply)" ;;
 esac

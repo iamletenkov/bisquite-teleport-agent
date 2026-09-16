@@ -1,6 +1,9 @@
 name: teleport-agent
-version: 2.1.1
+version: 2.2.0
 layout: 2
+# 2.2.0: иконка приложения в веб-морде — необязательный ключ ICON= в объявлении
+#        apps.d и ручка TELEPORT_APPS_ICONS; teleport.icon зарезервирован
+#        в TELEPORT_LABELS (иначе дубль ключа в метках приложения).
 # 2.1.0: ручки — домен teleport библиотеки bisquite-conf (схема knobs);
 #        bisquite-teleport ставится ссылкой, свои разбор и проверки удалены.
 family: deb
