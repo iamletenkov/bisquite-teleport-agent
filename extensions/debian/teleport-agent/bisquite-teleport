@@ -14,7 +14,9 @@
 # `set` — то же, что `bisquite-conf set --apply teleport`:
 #
 #   TELEPORT_PROXY=host[:443]       прокси кластера; только через join
-#   TELEPORT_TOKEN=                 join-токен (node[,app]); стирается после регистрации
+#   TELEPORT_JOIN_METHOD=token      token | bound_keypair; только через join
+#   TELEPORT_TOKEN=                 token: join-токен (node[,app]), стирается после
+#                                   регистрации; bound_keypair: имя токена, остаётся
 #   TELEPORT_CA_PIN=sha256:…        необязательно: сверка CA кластера
 #   TELEPORT_ENV=                   метка env — по ней smart_role даёт доступ
 #   TELEPORT_NODENAME=              пусто — короткое имя хоста
@@ -24,6 +26,16 @@
 #   TELEPORT_APPS_ICONS=имя=икон,…  иконка приложения в веб-морде прокси
 #   TELEPORT_APPS_DISCOVERY=1       0 — не читать /etc/bisquite/teleport/apps.d
 #   TELEPORT_OS_LOGINS=1            0 — без динамической метки ноды os_logins
+#
+# Только в join, для TELEPORT_JOIN_METHOD=bound_keypair (не ручки — в config
+# не пишутся, в вывод не попадают):
+#
+#   TELEPORT_REGISTRATION_SECRET=-          секрет регистрации со stdin (или значением)
+#   TELEPORT_REGISTRATION_SECRET_FILE=путь  …или из файла
+#
+# Секрет лежит в /var/lib/bisquite/teleport/registration-secret (0600) до
+# регистрации и стирается после неё; связанный ключ агент хранит в своём
+# /var/lib/teleport, и повторные подключения секрета не требуют.
 #
 # Объявления расширений — /etc/bisquite/teleport/apps.d/<имя>.conf, root:root,
 # не шире 0644, два обязательных ключа и один необязательный:
@@ -53,6 +65,12 @@ YAML="$ROOT/etc/teleport.yaml"
 DATA="$ROOT/var/lib/teleport"
 STATE="$ROOT/var/lib/bisquite/teleport"
 ROLLBACK="$STATE/rollback"
+# The path the agent reads (teleport.yaml), and the same file under the
+# scratch root of the tests.
+REG_SECRET_GUEST=/var/lib/bisquite/teleport/registration-secret
+REG_SECRET="$ROOT$REG_SECRET_GUEST"
+# bound_keypair joining for agents (not only bots) appeared in Teleport 18.8.
+BOUND_KEYPAIR_MIN=18.8.0
 TELEPORT_BIN="${TELEPORT_BIN:-/usr/local/bin/teleport}"
 JOIN_TIMEOUT="${BISQUITE_TELEPORT_JOIN_TIMEOUT:-120}"
 MANAGED_BY=bisquite-teleport-agent
@@ -75,6 +93,9 @@ RE_APP_NAME='^[a-z0-9][a-z0-9-]{0,62}$'
 # is silent. See README.
 RE_APP_ICON='^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
 RE_LOOPBACK_URI='^https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$'
+# The registration secret is not a knob: it goes to a file, never to YAML or
+# the config, so only its shape is checked — one printable word.
+RE_REG_SECRET='^[[:graph:]]{8,1024}$'
 
 log(){ >&2 echo "bisquite-teleport: $*"; }
 warn(){ log "ВНИМАНИЕ: $*"; }
@@ -267,7 +288,18 @@ cmd_render(){
         if [[ -n "${C[TELEPORT_TOKEN]}" ]]; then
             echo "  join_params:"
             echo "    token_name: \"${C[TELEPORT_TOKEN]}\""
-            echo "    method: token"
+            if [[ "${C[TELEPORT_JOIN_METHOD]}" == bound_keypair ]]; then
+                echo "    method: bound_keypair"
+                # Only the first join reads the secret: afterwards the key
+                # bound in data_dir authenticates, and the scrubbed secret
+                # leaves no path to a missing file behind.
+                if [[ -s "$REG_SECRET" ]]; then
+                    echo "    bound_keypair:"
+                    echo "      registration_secret_path: \"$REG_SECRET_GUEST\""
+                fi
+            else
+                echo "    method: token"
+            fi
         fi
         echo "ssh_service:"
         echo "  enabled: yes"
@@ -420,10 +452,33 @@ cmd_apply(){
     fi
 }
 
+# The registration secret becomes inert once used. The token name and the
+# method stay: they are not secret, and a re-join (a new system role, a CA
+# rotation) authenticates with the bound key under them.
+scrub_secret(){
+    [[ -e "$REG_SECRET" ]] || return 0
+    rm -f -- "$REG_SECRET"
+    [[ -n "${C[TELEPORT_PROXY]}" ]] && cmd_render
+    log "агент зарегистрирован — секрет регистрации стёрт, связанный ключ — в $DATA"
+}
+
+write_secret(){
+    local tmp
+    install -d -m 0700 "$STATE"
+    # mktemp creates the file 0600: the secret is never readable by others.
+    tmp="$(mktemp "$STATE/.registration-secret.XXXXXX")" || die "не создать файл в $STATE"
+    printf '%s\n' "$1" > "$tmp" || { rm -f -- "$tmp"; die "секрет регистрации не записан"; }
+    mv -f -- "$tmp" "$REG_SECRET"
+}
+
 scrub_token(){
     load_conf
-    [[ -n "${C[TELEPORT_TOKEN]}" ]] || return 0
     joined || return 0
+    if [[ "${C[TELEPORT_JOIN_METHOD]}" == bound_keypair ]]; then
+        scrub_secret
+        return 0
+    fi
+    [[ -n "${C[TELEPORT_TOKEN]}" ]] || return 0
     C[TELEPORT_TOKEN]=""
     save_conf TELEPORT_TOKEN=
     # teleport.yaml carries the token too; rewrite it without restarting —
@@ -466,6 +521,9 @@ cmd_join(){
         key="${pair%%=*}"; val="${pair#*=}"
         N[$key]="$val"
     done
+    if [[ "${N[TELEPORT_TOKEN]:-}" == - && "${N[TELEPORT_REGISTRATION_SECRET]:-}" == - ]]; then
+        die "со stdin читается одно значение: TELEPORT_TOKEN=- или TELEPORT_REGISTRATION_SECRET=-"
+    fi
     if [[ "${N[TELEPORT_TOKEN]:-}" == - ]]; then
         IFS= read -r val || true
         N[TELEPORT_TOKEN]="$val"
@@ -473,6 +531,36 @@ cmd_join(){
     [[ -n "${N[TELEPORT_PROXY]:-}" ]] || die "нужен TELEPORT_PROXY=host[:port]"
     [[ -n "${N[TELEPORT_TOKEN]:-}" ]] || die "нужен TELEPORT_TOKEN (или TELEPORT_TOKEN=- со stdin)"
     local force="${N[TELEPORT_FORCE]:-0}"; unset 'N[TELEPORT_FORCE]'
+    # The method follows this join, not the history: a join without it is a
+    # token join even on a machine that was bound_keypair before.
+    local method="${N[TELEPORT_JOIN_METHOD]:-token}"
+    N[TELEPORT_JOIN_METHOD]="$method"
+    # The registration secret is not a knob: it leaves N before validation
+    # and never reaches the config, argv of children or the log.
+    local secret="" has_secret=0
+    if [[ -n "${N[TELEPORT_REGISTRATION_SECRET]+x}" && -n "${N[TELEPORT_REGISTRATION_SECRET_FILE]+x}" ]]; then
+        die "секрет регистрации — одно из двух: TELEPORT_REGISTRATION_SECRET или TELEPORT_REGISTRATION_SECRET_FILE"
+    fi
+    if [[ -n "${N[TELEPORT_REGISTRATION_SECRET]+x}" ]]; then
+        has_secret=1; secret="${N[TELEPORT_REGISTRATION_SECRET]}"
+        if [[ "$secret" == - ]]; then IFS= read -r secret || true; fi
+    elif [[ -n "${N[TELEPORT_REGISTRATION_SECRET_FILE]+x}" ]]; then
+        has_secret=1
+        [[ -f "${N[TELEPORT_REGISTRATION_SECRET_FILE]}" && -r "${N[TELEPORT_REGISTRATION_SECRET_FILE]}" ]] \
+            || die "файл секрета регистрации '${N[TELEPORT_REGISTRATION_SECRET_FILE]}' не прочитать"
+        secret="$(< "${N[TELEPORT_REGISTRATION_SECRET_FILE]}")"
+    fi
+    unset 'N[TELEPORT_REGISTRATION_SECRET]' 'N[TELEPORT_REGISTRATION_SECRET_FILE]'
+    # Surrounding whitespace (a newline from echo or a file) is not the secret;
+    # Teleport trims the file the same way.
+    secret="${secret#"${secret%%[![:space:]]*}"}"; secret="${secret%"${secret##*[![:space:]]}"}"
+    if [[ "$method" == bound_keypair ]]; then
+        if (( has_secret )) && [[ ! "$secret" =~ $RE_REG_SECRET ]]; then
+            die "секрет регистрации: ожидали 8–1024 печатных знаков без пробелов"
+        fi
+    elif (( has_secret )); then
+        die "TELEPORT_REGISTRATION_SECRET* — только для TELEPORT_JOIN_METHOD=bound_keypair"
+    fi
     for key in "${!N[@]}"; do pairs+=("$key=${N[$key]}"); done
     # Proxy and token are validated here and only here: they change through join.
     conf_validate teleport --allow-ro "${pairs[@]}" || exit 1
@@ -489,12 +577,16 @@ cmd_join(){
         log "уже зарегистрирован в ${N[TELEPORT_PROXY]} — переподключение не нужно (TELEPORT_FORCE=1 — принудительно)"
         pairs=()
         for key in "${!N[@]}"; do
-            [[ "$key" == TELEPORT_PROXY || "$key" == TELEPORT_TOKEN ]] && continue
+            [[ "$key" == TELEPORT_PROXY || "$key" == TELEPORT_TOKEN || "$key" == TELEPORT_JOIN_METHOD ]] && continue
             pairs+=("$key=${N[$key]}")
         done
         save_conf "${pairs[@]}"
         apply_running
         return 0
+    fi
+    # Past the idempotent exit: a registered robot needs no secret to rerun.
+    if [[ "$method" == bound_keypair && -z "$secret" ]]; then
+        die "bound_keypair: нужен секрет регистрации — TELEPORT_REGISTRATION_SECRET=- (stdin) или TELEPORT_REGISTRATION_SECRET_FILE=<путь>"
     fi
     [[ -n "${C[TELEPORT_ENV]}${N[TELEPORT_ENV]:-}" ]] || \
         warn "TELEPORT_ENV не задан: ноду и приложения увидят только роли access/editor"
@@ -504,6 +596,11 @@ cmd_join(){
     joined && was_joined=1
     agent="$(version_of_agent)"
     [[ -n "$agent" ]] || die "$TELEPORT_BIN не отвечает на version — расширение не установлено?"
+    # The agent may not be newer than the cluster (below), so an agent of
+    # 18.8+ also guarantees the cluster side of bound_keypair.
+    if [[ "$method" == bound_keypair ]] && semver_gt "$BOUND_KEYPAIR_MIN" "$agent"; then
+        die "bound_keypair: нужен агент версии не ниже $BOUND_KEYPAIR_MIN, установлен $agent — пересоберите образ с TELEPORT_VERSION ≥ $BOUND_KEYPAIR_MIN"
+    fi
     if server="$(probe_proxy "${N[TELEPORT_PROXY]}")"; then
         if [[ -n "$server" ]]; then
             if semver_gt "$agent" "$server"; then
@@ -538,6 +635,9 @@ cmd_join(){
     fi
     for key in "${!N[@]}"; do pairs+=("$key=${N[$key]}"); done
     save_conf "${pairs[@]}"
+    # A secret of an earlier bound_keypair join must not outlive it.
+    rm -f -- "$REG_SECRET"
+    [[ "$method" == bound_keypair ]] && write_secret "$secret"
     cmd_render
 
     if ! has_systemd; then
@@ -573,6 +673,8 @@ cmd_join(){
         find "$ROLLBACK/data" -mindepth 1 -maxdepth 1 -exec mv -t "$DATA" -- {} +
         [[ -f "$ROLLBACK/config" ]] && cp -a "$ROLLBACK/config" "$CONF"
         [[ -f "$ROLLBACK/teleport.yaml" ]] && cp -a "$ROLLBACK/teleport.yaml" "$YAML"
+        # The restored registration has its own identity; the new secret goes.
+        rm -f -- "$REG_SECRET"
         systemctl start teleport.service
         rm -r -f -- "$ROLLBACK"
         die "join не удался, прежняя регистрация восстановлена — journalctl -u teleport"
@@ -604,7 +706,8 @@ cmd_leave(){
     [[ -d "$DATA" ]] && find "$DATA" -mindepth 1 -maxdepth 1 -exec rm -r -f -- {} +
     rm -f "$YAML"
     rm -r -f -- "$ROLLBACK"
-    save_conf TELEPORT_PROXY= TELEPORT_TOKEN= TELEPORT_CA_PIN=
+    rm -f -- "$REG_SECRET"
+    save_conf TELEPORT_PROXY= TELEPORT_TOKEN= TELEPORT_CA_PIN= TELEPORT_JOIN_METHOD=token
     log "отключено: агент выключен, состояние стёрто. Запись ноды в кластере исчезнет по истечении heartbeat или удаляется в админке."
 }
 
@@ -614,7 +717,8 @@ cmd_status(){
     echo "Ручки ($CONF):"
     for k in "${KEYS[@]}"; do
         v="${C[$k]}"
-        [[ "$k" == TELEPORT_TOKEN && -n "$v" ]] && v="<задан>"
+        # A bound_keypair token name is not a secret: the key in data_dir is.
+        [[ "$k" == TELEPORT_TOKEN && -n "$v" && "${C[TELEPORT_JOIN_METHOD]}" != bound_keypair ]] && v="<задан>"
         printf '  %-24s %s\n' "$k" "${v:-—}"
     done
     echo
@@ -623,6 +727,13 @@ cmd_status(){
         echo "Служба teleport: $(systemctl is-active teleport.service 2>/dev/null), $(systemctl is-enabled teleport.service 2>/dev/null)"
     fi
     if joined; then echo "Регистрация: есть (host_uuid $(cat "$DATA/host_uuid"))"; else echo "Регистрация: нет"; fi
+    if [[ "${C[TELEPORT_JOIN_METHOD]}" == bound_keypair ]]; then
+        if [[ -s "$REG_SECRET" ]]; then
+            echo "Секрет регистрации: задан (стирается после регистрации)"
+        else
+            echo "Секрет регистрации: нет — подключения идут по связанному ключу в $DATA"
+        fi
+    fi
     app_role_missing && echo "ВНИМАНИЕ: $APP_ROLE_HINT"
     if [[ -n "${C[TELEPORT_PROXY]}" ]]; then
         local host node; host="$(proxy_host "$(proxy_with_port "${C[TELEPORT_PROXY]}")")"
