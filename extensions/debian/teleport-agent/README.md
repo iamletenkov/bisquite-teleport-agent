@@ -8,6 +8,10 @@
 > в `/var/lib/bisquite/teleport`.
 > Нужен bisquite с поддержкой `layout: 2`.
 
+> **С 2.3.0 — метка `os_logins`.** Нода публикует список логинов ОС
+> динамической меткой (см. «Метка os_logins»); выключается
+> `TELEPORT_OS_LOGINS=0`. Ключ `os_logins` в `TELEPORT_LABELS` — отказ.
+
 > **С 2.1.0 — библиотека настроек.** `/etc/bisquite/teleport/config` — домен
 > `teleport` библиотеки `bisquite-conf` (схема `knobs`): `bisquite-teleport`
 > больше не держит свои разбор и проверки значений, `bisquite-conf set teleport …`
@@ -85,7 +89,7 @@ bisquite-teleport status            что настроено и что опуб
 | `TELEPORT_ENV` | фактически да | метка `env`: по ней `smart_role` даёт доступ; без неё ноду видят только `access`/`editor` |
 | `TELEPORT_CA_PIN` | нет | `sha256:…` из `tctl status`; у прокси с публичным сертификатом TLS проверяется и без него |
 | `TELEPORT_NODENAME` | нет | по умолчанию короткое имя хоста (из cloud-init) |
-| `TELEPORT_LABELS` | нет | `site=lab,robot=orin`; ключи `env`, `app`, `managed_by` — отказ |
+| `TELEPORT_LABELS` | нет | `site=lab,robot=orin`; ключи `env`, `app`, `managed_by`, `os_logins`, `teleport.icon` — отказ |
 | `TELEPORT_FORCE` | нет | `1` — переподключиться к тому же кластеру заново |
 
 Что делает `join`, по порядку:
@@ -108,7 +112,7 @@ bisquite-teleport status            что настроено и что опуб
 
 `TELEPORT_ENV`, `TELEPORT_NODENAME`, `TELEPORT_LABELS`, `TELEPORT_APPS`,
 `TELEPORT_APPS_DISABLE`, `TELEPORT_APPS_ICONS`, `TELEPORT_APPS_DISCOVERY`,
-`TELEPORT_CA_PIN`.
+`TELEPORT_OS_LOGINS`, `TELEPORT_CA_PIN`.
 Применяет к работающему агенту через reload (HUP — мягкий перезапуск Teleport,
 открытые SSH-сессии живут). `TELEPORT_PROXY` и `TELEPORT_TOKEN` — только `join`:
 в схеме они `ro:`, и `set` отказывает текстом из неё.
@@ -118,13 +122,54 @@ bisquite-teleport status            что настроено и что опуб
 значение ложится в YAML в двойных кавычках), пишет библиотека, а хук
 `knobs.apply` (`bisquite-teleport apply`) собирает `teleport.yaml` и ставит
 reload в очередь без ожидания — `set` бывает и внутри `cloud-final`.
-Зарезервированные ключи меток (`env`, `app`, `managed_by`, `teleport.icon`)
+Зарезервированные ключи меток (`env`, `app`, `managed_by`, `os_logins`, `teleport.icon`)
 проверяет сам `bisquite-teleport` — в `set`, `join` и `render`.
 
 ### leave
 
 Запись ноды в кластере сама не удаляется — у ноды нет на это прав. Она
 исчезнет по истечении heartbeat, либо удаляется в админке.
+
+## Метка os_logins
+
+Нода публикует динамическую метку `os_logins` — список логинов ОС, под
+которыми на машину вообще можно войти:
+
+```
+os_logins=robot,root
+```
+
+Зачем: портал Stvor показывает оператору список доступных логинов робота,
+проверяет по нему логины в заявках и ролях и следит, когда нужная учётка
+появилась (например, после `cloud-init` или установки расширения). **Метка —
+справка, а не право:** кто и под каким логином входит, по-прежнему решают роли
+Teleport (`logins` роли, `smart_role`); метка ничего не открывает и не
+закрывает.
+
+Как считается — команда `bisquite-teleport os-logins`, её агент запускает сам
+раз в 5 минут (`ssh_service.commands` Teleport, `period: 5m0s`):
+
+- источник — NSS (`getent passwd`): локальные учётки и каталоги, которые NSS
+  перечисляет (sssd по умолчанию не перечисляет — таких пользователей в
+  списке не будет);
+- `root` и учётки с uid ≥ 1000, кроме `nobody` (65534); системные с uid < 1000
+  не попадают, даже если у них есть shell;
+- shell не `nologin`, `false`, `true`, `sync`, `shutdown`, `halt`; пустое поле
+  shell — это `/bin/sh`, учётка попадает;
+- имя вне алфавита метки (`[A-Za-z0-9._-]`, до 32 знаков, например `ad$`)
+  пропускается, а не искажается: искажённое имя было бы логином, которого нет;
+- дубли убраны, порядок — байтовая сортировка (`LC_ALL=C`), через запятую;
+- длиннее 255 знаков — обрезается по целому имени и заканчивается `,...`;
+- команда всегда выходит с кодом 0: на ненулевом коде Teleport кладёт в метку
+  текст ошибки. Не прочитался `passwd` — метка пустая.
+
+Новая учётка видна в метке не позже чем через 5 минут, без перезапуска агента.
+Выключить — `sudo bisquite-teleport set TELEPORT_OS_LOGINS=0`: секции
+`commands` в `teleport.yaml` не будет, метка пропадёт после reload. Задать
+`os_logins` руками через `TELEPORT_LABELS` нельзя — отказ, как для `env`:
+у Teleport динамическая метка побеждает статическую с тем же ключом, и
+значение оператора молча терялось бы. Метку получает только нода, не
+приложения.
 
 ## Приложения
 
@@ -211,6 +256,15 @@ https на петле публикуется с `insecure_skip_verify`: у code-
 - `ssh_service.listen_addr: 127.0.0.1:3022` — наружу порт не нужен, SSH идёт
   через обратный туннель;
 - метки ноды: `TELEPORT_LABELS`, `managed_by=bisquite-teleport-agent`, `env`;
+- динамическая метка ноды `os_logins` (если `TELEPORT_OS_LOGINS=1`):
+
+  ```yaml
+    commands:
+      - name: "os_logins"
+        command: ["/usr/local/sbin/bisquite-teleport", "os-logins"]
+        period: 5m0s
+  ```
+
 - приложение `<имя>-<нода>`, `public_addr: <имя>.<нода>.<хост прокси>`;
 - метка `teleport.icon` приложения — только если иконку задали; иначе строки
   нет, и прокси угадывает сам;

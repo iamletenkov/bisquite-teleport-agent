@@ -7,6 +7,7 @@
 #   bisquite-teleport status            что настроено, зарегистрирован ли, что опубликовано
 #   bisquite-teleport render            собрать /etc/teleport.yaml (зовёт teleport.service)
 #   bisquite-teleport apply             применить записанное к работающему агенту (хук)
+#   bisquite-teleport os-logins         логины ОС одной строкой (метка os_logins, зовёт агент)
 #
 # Ручки — /etc/bisquite/teleport/config (0600), домен `teleport` библиотеки
 # bisquite-conf; типы и шаблоны значений — схема knobs рядом со скриптом.
@@ -22,6 +23,7 @@
 #   TELEPORT_APPS_DISABLE=имя,…     не публиковать объявленное
 #   TELEPORT_APPS_ICONS=имя=икон,…  иконка приложения в веб-морде прокси
 #   TELEPORT_APPS_DISCOVERY=1       0 — не читать /etc/bisquite/teleport/apps.d
+#   TELEPORT_OS_LOGINS=1            0 — без динамической метки ноды os_logins
 #
 # Объявления расширений — /etc/bisquite/teleport/apps.d/<имя>.conf, root:root,
 # не шире 0644, два обязательных ключа и один необязательный:
@@ -54,6 +56,13 @@ ROLLBACK="$STATE/rollback"
 TELEPORT_BIN="${TELEPORT_BIN:-/usr/local/bin/teleport}"
 JOIN_TIMEOUT="${BISQUITE_TELEPORT_JOIN_TIMEOUT:-120}"
 MANAGED_BY=bisquite-teleport-agent
+# The path the agent execs for the os_logins label: the link install.sh lays
+# down, not $0 — render also runs under a scratch root in the tests.
+OS_LOGINS_CMD=/usr/local/sbin/bisquite-teleport
+# Teleport puts no limit on a label value, but the value travels in every
+# heartbeat, `tsh ls` and the portal; a list longer than this is cut at a
+# whole name and ends with `,...`.
+OS_LOGINS_MAX=255
 
 # The knob values are validated by the schema (knobs); these two check what
 # is not a knob: the hostname fallback of the node name and apps.d files.
@@ -94,8 +103,9 @@ save_conf(){
     conf_set teleport --allow-ro "$@" || die "не записано в $CONF"
 }
 
-# The one rule the schema cannot express: env, app and managed_by are set by
-# this script, and a label may not override the access decision.
+# The one rule the schema cannot express: env, app, managed_by and os_logins
+# are set by this script, and a label may not override the access decision
+# or pose as the agent's own report of the OS logins.
 check_labels(){
     local val="$1" item
     local -a items
@@ -105,6 +115,11 @@ check_labels(){
         case "${item%%=*}" in
             env|app|managed_by)
                 die "TELEPORT_LABELS: ключ '${item%%=*}' зарезервирован (env задаётся TELEPORT_ENV)" ;;
+            # A static label and a dynamic one of the same name: the dynamic
+            # one wins in Teleport, so the operator's value would be silently
+            # lost. Refused like env.
+            os_logins)
+                die "TELEPORT_LABELS: ключ 'os_logins' зарезервирован — динамическая метка ставится агентом (выключить: TELEPORT_OS_LOGINS=0)" ;;
             # A node-wide icon label would land in the same YAML map as the
             # app's own one — a duplicate key, and teleport.yaml would not
             # parse at all.
@@ -261,6 +276,14 @@ cmd_render(){
         echo "  listen_addr: 127.0.0.1:3022"
         echo "  labels:"
         while IFS=$'\t' read -r k v; do echo "    \"$k\": \"$v\""; done <<< "$labels"
+        # Dynamic label: the agent runs the command every period and puts its
+        # trimmed stdout into the label. Node only — apps do not get it.
+        if [[ "${C[TELEPORT_OS_LOGINS]}" == 1 ]]; then
+            echo "  commands:"
+            echo "    - name: \"os_logins\""
+            echo "      command: [\"$OS_LOGINS_CMD\", \"os-logins\"]"
+            echo "      period: 5m0s"
+        fi
         if [[ -n "$apps" ]]; then
             echo "app_service:"
             echo "  enabled: yes"
@@ -302,6 +325,49 @@ cmd_render(){
         echo "  enabled: no"
     } > "$tmp"
     mv -f "$tmp" "$YAML"
+}
+
+# ---------------------------------------------------------------------------
+# os-logins — значение динамической метки os_logins
+# ---------------------------------------------------------------------------
+# Accounts with an interactive shell: root and uid >= 1000 (not nobody),
+# shell not nologin/false/…; an empty shell field means /bin/sh. The source is
+# NSS (`getent passwd`): directory users show up only where NSS enumerates
+# them (sssd does not by default). A name outside the label alphabet is
+# skipped rather than mangled — a mangled name would be a login that does not
+# exist.
+#
+# Always exit 0: on a non-zero exit Teleport puts the error text into the
+# label instead of a list.
+cmd_os_logins(){
+    local passwd name uid shell out="" n
+    local -a names=()
+    if [[ -n "$ROOT" ]]; then
+        passwd="$(cat "$ROOT/etc/passwd" 2>/dev/null)" || passwd=""
+    else
+        passwd="$(getent passwd 2>/dev/null)" || passwd=""
+    fi
+    while IFS=: read -r name _ uid _ _ _ shell; do
+        [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,31}$ && "$uid" =~ ^[0-9]+$ ]] || continue
+        (( uid == 0 || (uid >= 1000 && uid != 65534) )) || continue
+        case "${shell##*/}" in
+            nologin|false|true|sync|shutdown|halt) continue ;;
+        esac
+        names+=("$name")
+    done <<< "$passwd"
+    (( ${#names[@]} )) || return 0
+    mapfile -t names < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort -u)
+    out="$(IFS=,; echo "${names[*]}")"
+    if (( ${#out} > OS_LOGINS_MAX )); then
+        # Whole names only, then the marker: `,...` is 4 characters.
+        out=""
+        for n in "${names[@]}"; do
+            (( ${#out} + 1 + ${#n} + 4 <= OS_LOGINS_MAX )) || break
+            out+="${out:+,}$n"
+        done
+        out+=",..."
+    fi
+    printf '%s\n' "$out"
 }
 
 # ---------------------------------------------------------------------------
@@ -588,6 +654,7 @@ case "${1:-}" in
     render) cmd_render ;;
     apply) shift; cmd_apply "$@" ;;
     scrub-token) need_root; scrub_token ;;
+    os-logins) cmd_os_logins; exit 0 ;;
     -h|--help|help|"") sed -n '2,${/^#/!q; s/^# \{0,1\}//; p}' "$0" ;;
-    *) die "неизвестная команда '$1' (join|set|leave|status|render|apply)" ;;
+    *) die "неизвестная команда '$1' (join|set|leave|status|render|apply|os-logins)" ;;
 esac

@@ -1,6 +1,10 @@
 name: teleport-agent
-version: 2.2.0
+version: 2.3.0
 layout: 2
+# 2.3.0: динамическая метка ноды os_logins — логины ОС с интерактивным shell
+#        (root и uid ≥ 1000), команда `bisquite-teleport os-logins` раз в 5 мин;
+#        ручка TELEPORT_OS_LOGINS (1 по умолчанию), os_logins зарезервирован
+#        в TELEPORT_LABELS.
 # 2.2.0: иконка приложения в веб-морде — необязательный ключ ICON= в объявлении
 #        apps.d и ручка TELEPORT_APPS_ICONS; teleport.icon зарезервирован
 #        в TELEPORT_LABELS (иначе дубль ключа в метках приложения).

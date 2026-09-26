@@ -16,3 +16,4 @@ TELEPORT_APPS              list:re:^[a-z0-9][a-z0-9-]{0,62}=([0-9]{1,5}|https?:/
 TELEPORT_APPS_DISABLE      list:re:^[a-z0-9][a-z0-9-]{0,62}$                              —   не публиковать объявленные приложения: имена через запятую
 TELEPORT_APPS_ICONS        list:re:^[a-z0-9][a-z0-9-]{0,62}=[A-Za-z0-9][A-Za-z0-9._-]{0,63}$  —   иконка приложения в веб-морде прокси: имя=иконка через запятую; имя иконки — ключ вшитого в прокси набора, побеждает ICON= объявления
 TELEPORT_APPS_DISCOVERY    bool                                                           1   0 — не читать объявления /etc/bisquite/teleport/apps.d
+TELEPORT_OS_LOGINS         bool                                                           1   динамическая метка ноды os_logins — логины ОС с shell (root и uid ≥ 1000); 0 — не публиковать
