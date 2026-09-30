@@ -1,13 +1,14 @@
 # Подключение к Teleport — /etc/bisquite/teleport/config (0600: токен).
 # Читает `bisquite-teleport render` на каждом старте teleport.service.
-# Кластер (прокси и токен) меняется только `bisquite-teleport join`:
+# Кластер (прокси, метод и токен) меняется только `bisquite-teleport join`:
 # новый прокси при CA старого в /var/lib/teleport не подключится никогда.
 # Каждое значение ложится в YAML в двойных кавычках, поэтому шаблоны
 # исключают кавычки, переводы строки и `$` (те же списки, что в ldap-admin-api).
 #
 # ключ                     тип                                                          умолчание  описание
 TELEPORT_PROXY             ro:re:^[a-z0-9][a-z0-9.-]{0,252}(:[0-9]{1,5})?$                —   прокси кластера host[:port]; меняется только через bisquite-teleport join (новый кластер — новая регистрация)
-TELEPORT_TOKEN             ro:secret:re:^[A-Za-z0-9._-]{8,256}$                           —   join-токен (node[,app]); только через bisquite-teleport join, стирается после регистрации
+TELEPORT_JOIN_METHOD       ro:enum:token,bound_keypair                                    token   метод join: token — общий токен, bound_keypair — имя токена плюс одноразовый секрет регистрации (Teleport ≥ 18.8); только через bisquite-teleport join
+TELEPORT_TOKEN             ro:secret:re:^[A-Za-z0-9._-]{8,256}$                           —   token: join-токен (node[,app]), стирается после регистрации; bound_keypair: имя токена, остаётся; только через bisquite-teleport join
 TELEPORT_CA_PIN            re:^sha256:[0-9a-f]{64}$                                       —   необязательная сверка CA кластера: sha256:<64 hex>
 TELEPORT_ENV               "re:^[a-zA-Z0-9][a-zA-Z0-9_./ -]{0,127}$"                      —   метка env — по ней smart_role даёт доступ
 TELEPORT_NODENAME          re:^[a-z0-9][a-z0-9-]{1,62}$                                   —   имя ноды, метка DNS; пусто — короткое имя хоста
