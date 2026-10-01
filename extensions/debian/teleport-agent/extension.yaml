@@ -1,6 +1,13 @@
 name: teleport-agent
-version: 2.4.0
+version: 2.5.0
 layout: 2
+# 2.5.0: метки space и env с портала. `set-managed` сливает space в
+#        TELEPORT_LABELS и пишет TELEPORT_ENV одним перезапуском агента (не HUP:
+#        SSH и приложения переезжают вместе); `pull` — тик таймера
+#        bisquite-teleport-labels.timer (раз в минуту, сверяет фактические
+#        ручки с ожидаемыми); `labels-enable URL=…` — токен со stdin в файл
+#        0600 и таймер; ручка TELEPORT_LABELS_URL; update.sh — обновление
+#        расширения из архива на работающем роботе. join не изменился.
 # 2.4.0: join методом bound_keypair (TELEPORT_JOIN_METHOD, секрет регистрации
 #        со stdin или из файла, стирается после регистрации; ключ — в
 #        /var/lib/teleport); Teleport по умолчанию 18.10.0; метод token и его

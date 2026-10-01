@@ -8,6 +8,9 @@
 #   bisquite-teleport render            собрать /etc/teleport.yaml (зовёт teleport.service)
 #   bisquite-teleport apply             применить записанное к работающему агенту (хук)
 #   bisquite-teleport os-logins         логины ОС одной строкой (метка os_logins, зовёт агент)
+#   bisquite-teleport set-managed env=… space=…   метки, которыми управляет портал
+#   bisquite-teleport pull              забрать метки с портала и применить (зовёт таймер)
+#   bisquite-teleport labels-enable URL=…   включить автоприменение (токен — со stdin)
 #
 # Ручки — /etc/bisquite/teleport/config (0600), домен `teleport` библиотеки
 # bisquite-conf; типы и шаблоны значений — схема knobs рядом со скриптом.
@@ -26,6 +29,18 @@
 #   TELEPORT_APPS_ICONS=имя=икон,…  иконка приложения в веб-морде прокси
 #   TELEPORT_APPS_DISCOVERY=1       0 — не читать /etc/bisquite/teleport/apps.d
 #   TELEPORT_OS_LOGINS=1            0 — без динамической метки ноды os_logins
+#   TELEPORT_LABELS_URL=            адрес меток на портале; задаёт labels-enable
+#
+# Метки с портала (space и env): портал — источник правды о том, в каком
+# пространстве робот. `labels-enable URL=https://<портал>/robot-api/v1/labels`
+# читает токен со stdin в /etc/bisquite/teleport/labels-token (0600; не ручка:
+# ручки печатает `status`) и включает bisquite-teleport-labels.timer; тик
+# таймера — `pull`. Он сверяет ожидаемые метки (последний ответ портала,
+# /var/lib/bisquite/teleport/labels-expected) с фактическими ручками на
+# каждом тике и при расхождении зовёт `set-managed`: space сливается в
+# TELEPORT_LABELS (прочие метки оператора остаются), env — в TELEPORT_ENV,
+# агент перезапускается один раз (не HUP: открытые SSH-сессии людей прежнего
+# пространства рвутся, узел и приложения переезжают одновременно).
 #
 # Только в join, для TELEPORT_JOIN_METHOD=bound_keypair (не ручки — в config
 # не пишутся, в вывод не попадают):
@@ -96,13 +111,33 @@ RE_LOOPBACK_URI='^https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]{1,5})?(/[A-Za
 # The registration secret is not a knob: it goes to a file, never to YAML or
 # the config, so only its shape is checked — one printable word.
 RE_REG_SECRET='^[[:graph:]]{8,1024}$'
+# Labels from the portal (contract GET /robot-api/v1/labels). Values are
+# checked here before they reach the config: a DNS-label alphabet, so no
+# quote, comma, `=` or newline can reach TELEPORT_LABELS or YAML.
+RE_MANAGED_VALUE='^[a-z0-9][a-z0-9-]{0,62}$'
+RE_LABELS_TOKEN='^[A-Za-z0-9_-]{43}$'
+RE_LABELS_URL='^https://[a-z0-9.-]+(:[0-9]{1,5})?/robot-api/v1/labels$'
+RE_REVISION='^[0-9a-f]{16}$'
+LABELS_TOKEN="$ROOT/etc/bisquite/teleport/labels-token"
+LABELS_EXPECTED="$STATE/labels-expected"
+LABELS_APPLIED="$STATE/labels-applied"
+LABELS_TIMER=bisquite-teleport-labels.timer
+RESTART_TIMEOUT="${BISQUITE_TELEPORT_RESTART_TIMEOUT:-30}"
 
 log(){ >&2 echo "bisquite-teleport: $*"; }
 warn(){ log "ВНИМАНИЕ: $*"; }
 die(){ log "ОШИБКА: $*"; exit 1; }
 
 need_root(){ [[ -n "$ROOT" || "$(id -u)" -eq 0 ]] || die "нужен root (sudo)"; }
-has_systemd(){ [[ -z "$ROOT" && -d /run/systemd/system ]]; }
+# BISQUITE_TELEPORT_SYSTEMD=1|0 overrides the detection — the tests drive a
+# fake systemctl under a scratch root.
+has_systemd(){
+    case "${BISQUITE_TELEPORT_SYSTEMD:-}" in
+        1) return 0 ;;
+        0) return 1 ;;
+    esac
+    [[ -z "$ROOT" && -d /run/systemd/system ]]
+}
 
 # ---------------------------------------------------------------------------
 # Файл ручек — через bisquite-conf: без `source`, со схемой knobs.
@@ -698,6 +733,307 @@ cmd_set(){
     conf_cli_set --apply teleport "$@" || exit 1
 }
 
+# ---------------------------------------------------------------------------
+# Метки с портала: set-managed, pull, labels-enable
+# ---------------------------------------------------------------------------
+# The portal manages exactly two labels: space (one item of TELEPORT_LABELS)
+# and env (TELEPORT_ENV). Every other operator label stays as it is.
+
+# The space value of a TELEPORT_LABELS list; the last item wins, as in render.
+labels_space(){
+    local item out=""
+    local -a items=()
+    [[ -n "$1" ]] && IFS=',' read -r -a items <<< "$1"
+    for item in "${items[@]}"; do
+        [[ "${item%%=*}" == space ]] && out="${item#*=}"
+    done
+    printf '%s' "$out"
+}
+
+# TELEPORT_LABELS with space=$2: in place of the first space item (other
+# space items dropped), appended when there was none.
+labels_with_space(){
+    local item out="" put=0
+    local -a items=()
+    [[ -n "$1" ]] && IFS=',' read -r -a items <<< "$1"
+    for item in "${items[@]}"; do
+        if [[ "${item%%=*}" == space ]]; then
+            (( put )) && continue
+            item="space=$2"; put=1
+        fi
+        out+="${out:+,}$item"
+    done
+    (( put )) || out+="${out:+,}space=$2"
+    printf '%s' "$out"
+}
+
+# Restart, not reload: on HUP Teleport keeps the open SSH sessions of people
+# of the old space while the apps already answer by the new labels. One
+# restart moves the node and every app together (the sessions break, the
+# robot is away for a few seconds). Then wait for the agent to be active.
+restart_agent(){
+    local waited=0
+    systemctl restart teleport.service >/dev/null 2>&1 || true
+    while :; do
+        systemctl is-active --quiet teleport.service && return 0
+        (( waited < RESTART_TIMEOUT )) || return 1
+        sleep 1; waited=$((waited + 1))
+    done
+}
+
+# Is the agent running with what the config says? Without systemd (a build,
+# a chroot) the config is all there is.
+agent_running(){
+    [[ -n "${C[TELEPORT_PROXY]}" ]] || return 1
+    has_systemd || return 0
+    systemctl is-active --quiet teleport.service
+}
+
+# apply_managed <env|""> <space|""> — write through the library without the
+# apply hook (its reload is the HUP above), then one restart. 0 — applied or
+# nothing to change, 1 — the agent did not come up.
+apply_managed(){
+    local env="$1" space="$2" labels pair
+    local -a pairs=()
+    load_conf
+    if [[ -n "$space" ]]; then
+        labels="$(labels_with_space "${C[TELEPORT_LABELS]}" "$space")"
+        [[ "$labels" != "${C[TELEPORT_LABELS]}" ]] && pairs+=("TELEPORT_LABELS=$labels")
+    fi
+    [[ -n "$env" && "$env" != "${C[TELEPORT_ENV]}" ]] && pairs+=("TELEPORT_ENV=$env")
+    if (( ${#pairs[@]} == 0 )); then
+        log "метки env и space уже такие — без изменений"
+        return 0
+    fi
+    save_conf "${pairs[@]}"
+    for pair in "${pairs[@]}"; do C[${pair%%=*}]="${pair#*=}"; done
+    log "записано: ${pairs[*]}"
+    if ! has_systemd; then
+        log "systemd не запущен — применится при старте агента"
+        return 0
+    fi
+    if [[ -z "${C[TELEPORT_PROXY]}" ]]; then
+        log "кластер не задан — применится после bisquite-teleport join"
+        return 0
+    fi
+    if ! restart_agent; then
+        log "ОШИБКА: агент не поднялся за ${RESTART_TIMEOUT} с после перезапуска — journalctl -u teleport"
+        return 1
+    fi
+    log "агент перезапущен: узел и приложения — с новыми метками"
+}
+
+cmd_set_managed(){
+    need_root
+    (( $# )) || die "set-managed: ожидали env=… и/или space=…"
+    local pair key val env="" space="" seen=" "
+    for pair in "$@"; do
+        [[ "$pair" == *=* ]] || die "set-managed: ожидали KEY=VALUE"
+        key="${pair%%=*}"; val="${pair#*=}"
+        case "$key" in
+            env|space) ;;
+            *) die "set-managed: порталом управляются только env и space" ;;
+        esac
+        [[ "$seen" == *" $key "* ]] && die "set-managed: ключ $key задан дважды"
+        seen+="$key "
+        # The value is not echoed: it is external input.
+        [[ "$val" =~ $RE_MANAGED_VALUE ]] \
+            || die "set-managed: $key — ожидали 1–63 знака [a-z0-9-], первый — буква или цифра"
+        if [[ "$key" == env ]]; then env="$val"; else space="$val"; fi
+    done
+    apply_managed "$env" "$space"
+}
+
+# Local state of the last portal answer. Read back with the same checks as
+# the answer itself: a hand-edited file is no state at all.
+read_expected(){
+    local line
+    EXP_REV=""; EXP_ENV=""; EXP_SPACE=""
+    [[ -f "$LABELS_EXPECTED" ]] || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            revision=*) EXP_REV="${line#*=}" ;;
+            env=*) EXP_ENV="${line#*=}" ;;
+            space=*) EXP_SPACE="${line#*=}" ;;
+        esac
+    done < "$LABELS_EXPECTED"
+    [[ "$EXP_REV" =~ $RE_REVISION && "$EXP_ENV" =~ $RE_MANAGED_VALUE && "$EXP_SPACE" =~ $RE_MANAGED_VALUE ]]
+}
+applied_revision(){
+    local r=""
+    [[ -f "$LABELS_APPLIED" ]] && r="$(< "$LABELS_APPLIED")"
+    [[ "$r" =~ $RE_REVISION ]] && printf '%s' "$r"
+    return 0
+}
+write_state(){ # write_state <file> <content>
+    local tmp
+    install -d -m 0700 "$STATE" || return 1
+    tmp="$(mktemp "$STATE/.labels.XXXXXX")" || return 1
+    printf '%s\n' "$2" > "$tmp" && mv -f -- "$tmp" "$1"
+}
+# Do the knobs carry what the portal expects?
+labels_match(){
+    load_conf
+    [[ "${C[TELEPORT_ENV]}" == "$EXP_ENV" && "$(labels_space "${C[TELEPORT_LABELS]}")" == "$EXP_SPACE" ]]
+}
+
+# The 200 body of GET /robot-api/v1/labels: exactly
+#   {"labels":{"env":"<v>","space":"<v>"},"revision":"<16 hex>"}
+# keys in this order, each once, whitespace between tokens only. Anything
+# else — a second object, a repeated key, an extra key — is refused whole.
+parse_labels(){
+    local f="$1" body w='[[:space:]]*' re
+    [[ -f "$f" ]] || return 1
+    (( $(wc -c < "$f") <= 4096 )) || return 1
+    # A NUL would vanish on read and glue two halves into a valid value.
+    [[ "$(wc -c < "$f")" == "$(tr -d '\000' < "$f" | wc -c)" ]] || return 1
+    body="$(< "$f")"
+    re="^${w}[{]${w}\"labels\"${w}:${w}[{]${w}\"env\"${w}:${w}\"([^\"]*)\"${w},${w}\"space\"${w}:${w}\"([^\"]*)\"${w}[}]${w},${w}\"revision\"${w}:${w}\"([^\"]*)\"${w}[}]${w}\$"
+    [[ "$body" =~ $re ]] || return 1
+    P_ENV="${BASH_REMATCH[1]}"; P_SPACE="${BASH_REMATCH[2]}"; P_REV="${BASH_REMATCH[3]}"
+    [[ "$P_ENV" =~ $RE_MANAGED_VALUE && "$P_SPACE" =~ $RE_MANAGED_VALUE && "$P_REV" =~ $RE_REVISION ]]
+}
+
+# One tick of the timer. Network and HTTP errors: one journal line, code 0 —
+# the next tick is the retry. A refused answer or an agent that did not come
+# up: code 1. The token travels only in a header file curl reads (-H @file):
+# never in argv, the journal or `status`.
+cmd_pull(){
+    need_root
+    load_conf
+    local url="${C[TELEPORT_LABELS_URL]}" token work code rc have_exp=0 report=0
+    if [[ -z "$url" ]]; then
+        log "метки с портала выключены: TELEPORT_LABELS_URL не задан — bisquite-teleport labels-enable"
+        return 0
+    fi
+    [[ "$url" =~ $RE_LABELS_URL ]] || die "TELEPORT_LABELS_URL не по шаблону — bisquite-teleport labels-enable"
+    if [[ ! -f "$LABELS_TOKEN" ]]; then
+        log "метки с портала выключены: нет $LABELS_TOKEN — bisquite-teleport labels-enable"
+        return 0
+    fi
+    token="$(< "$LABELS_TOKEN")"
+    [[ "$token" =~ $RE_LABELS_TOKEN ]] \
+        || die "$LABELS_TOKEN испорчен — выпустите токен меток на портале и выполните bisquite-teleport labels-enable"
+    install -d -m 0700 "$STATE" || die "не создать $STATE"
+    # One tick at a time: the timer and labels-enable may meet.
+    if command -v flock >/dev/null 2>&1; then
+        exec 9> "$STATE/.labels.lock"
+        flock -n 9 || { log "метки уже запрашиваются — пропускаю тик"; return 0; }
+    fi
+
+    if read_expected; then
+        have_exp=1
+        # R3: report only what is really in effect — the knobs carry the
+        # expected labels and the agent runs with them.
+        if [[ "$(applied_revision)" == "$EXP_REV" ]] && labels_match && agent_running; then
+            report=1
+        fi
+    fi
+    work="$(mktemp -d "$STATE/.pull.XXXXXX")" || die "не создать каталог в $STATE"
+    # shellcheck disable=SC2064  # the path is fixed now, on purpose
+    trap "rm -r -f -- '$work'" EXIT
+    {
+        printf 'Authorization: Bearer %s\n' "$token"
+        if (( have_exp )); then printf 'If-None-Match: "%s"\n' "$EXP_REV"; fi
+        if (( report )); then printf 'X-Applied-Revision: %s\n' "$EXP_REV"; fi
+    } > "$work/headers"
+    code="$(curl -sS --proto =https --connect-timeout 10 --max-time 30 --max-filesize 4096 \
+        -H "@$work/headers" -o "$work/body" -w '%{http_code}' "$url" 2>/dev/null)"; rc=$?
+    if (( rc != 0 )); then
+        log "портал недоступен ($url, curl $rc) — повтор на следующем тике"
+        return 0
+    fi
+    case "$code" in
+        200)
+            if ! parse_labels "$work/body"; then
+                log "ОШИБКА: ответ портала не по контракту /robot-api/v1/labels — метки не тронуты"
+                return 1
+            fi
+            EXP_REV="$P_REV"; EXP_ENV="$P_ENV"; EXP_SPACE="$P_SPACE"
+            write_state "$LABELS_EXPECTED" "revision=$EXP_REV"$'\n'"env=$EXP_ENV"$'\n'"space=$EXP_SPACE" \
+                || die "не записано $LABELS_EXPECTED"
+            ;;
+        304)
+            if (( ! have_exp )); then
+                log "портал ответил 304 без запомненных меток — повтор на следующем тике"
+                return 0
+            fi
+            ;;
+        401)
+            log "портал не принял токен меток (401) — выпустите токен на портале и выполните bisquite-teleport labels-enable"
+            return 0 ;;
+        429)
+            log "портал ограничил частоту запросов (429) — повтор на следующем тике"
+            return 0 ;;
+        *)
+            log "портал ответил ${code:-?} — повтор на следующем тике"
+            return 0 ;;
+    esac
+
+    # R3: the state, not the revision. ETag/304 only spares the body; a hand
+    # `set TELEPORT_LABELS=…`, a rerun of firstboot or a failed restart are
+    # undone here on every tick.
+    if ! labels_match; then
+        log "метки расходятся с порталом (env=$EXP_ENV, space=$EXP_SPACE) — применяю"
+        apply_managed "$EXP_ENV" "$EXP_SPACE" || return 1
+    elif [[ "$(applied_revision)" != "$EXP_REV" ]] && has_systemd && [[ -n "${C[TELEPORT_PROXY]}" ]] \
+         && ! systemctl is-active --quiet teleport.service; then
+        # Written on an earlier tick, but the agent did not come up then.
+        log "агент не активен — перезапускаю с метками портала"
+        if ! restart_agent; then
+            log "ОШИБКА: агент не поднялся за ${RESTART_TIMEOUT} с после перезапуска — journalctl -u teleport"
+            return 1
+        fi
+    fi
+    if [[ "$(applied_revision)" != "$EXP_REV" ]]; then
+        if agent_running; then
+            write_state "$LABELS_APPLIED" "$EXP_REV" || die "не записано $LABELS_APPLIED"
+            log "метки портала действуют (env=$EXP_ENV, space=$EXP_SPACE, ревизия $EXP_REV) — портал узнает на следующем тике"
+        else
+            log "метки записаны, агент не работает — ревизия не отмечена применённой"
+        fi
+    fi
+    return 0
+}
+
+# R2: not part of join — join's keys and stdin (the registration secret)
+# stay as they were. The token is not a knob: knobs are printed by `status`.
+cmd_labels_enable(){
+    need_root
+    local pair url="" token dir tmp old_url
+    for pair in "$@"; do
+        case "$pair" in
+            URL=*) url="${pair#URL=}" ;;
+            *) die "labels-enable: ожидали URL=https://<портал>/robot-api/v1/labels (токен — со stdin)" ;;
+        esac
+    done
+    [[ "$url" =~ $RE_LABELS_URL ]] \
+        || die "labels-enable: URL — ожидали https://<хост>[:порт]/robot-api/v1/labels"
+    IFS= read -r token || true
+    token="${token#"${token%%[![:space:]]*}"}"; token="${token%"${token##*[![:space:]]}"}"
+    [[ "$token" =~ $RE_LABELS_TOKEN ]] \
+        || die "labels-enable: токен со stdin не прочитан или не по форме (43 знака [A-Za-z0-9_-])"
+    load_conf
+    old_url="${C[TELEPORT_LABELS_URL]}"
+    dir="$(dirname "$LABELS_TOKEN")"
+    install -d -m 0755 "$dir" || die "не создать $dir"
+    # mktemp creates the file 0600: the token is never readable by others.
+    tmp="$(mktemp "$dir/.labels-token.XXXXXX")" || die "не создать файл в $dir"
+    printf '%s\n' "$token" > "$tmp" || { rm -f -- "$tmp"; die "токен меток не записан"; }
+    if ! { chmod 0600 "$tmp" && mv -f -- "$tmp" "$LABELS_TOKEN"; }; then
+        rm -f -- "$tmp"; die "токен меток не записан"
+    fi
+    # Another portal — the remembered answer of the old one means nothing.
+    [[ "$old_url" != "$url" ]] && rm -f -- "$LABELS_EXPECTED" "$LABELS_APPLIED"
+    save_conf "TELEPORT_LABELS_URL=$url"
+    log "токен меток — в $LABELS_TOKEN (0600), адрес — $url"
+    if has_systemd; then
+        systemctl enable --now "$LABELS_TIMER" >/dev/null 2>&1 \
+            || warn "$LABELS_TIMER не включён — юнитов меток нет? Обновите расширение (update.sh)"
+    fi
+    cmd_pull
+}
+
 cmd_leave(){
     need_root
     if has_systemd; then
@@ -735,6 +1071,18 @@ cmd_status(){
         fi
     fi
     app_role_missing && echo "ВНИМАНИЕ: $APP_ROLE_HINT"
+    if [[ -n "${C[TELEPORT_LABELS_URL]}" && -f "$LABELS_TOKEN" ]]; then
+        echo "Метки с портала: включено (${C[TELEPORT_LABELS_URL]}, токен задан)"
+    elif [[ -n "${C[TELEPORT_LABELS_URL]}" ]]; then
+        echo "Метки с портала: выключено — нет токена, bisquite-teleport labels-enable"
+    else
+        echo "Метки с портала: выключено"
+    fi
+    if read_expected; then
+        local applied="не применены"
+        [[ "$(applied_revision)" == "$EXP_REV" ]] && applied="действуют"
+        echo "  ожидаемые: env=$EXP_ENV space=$EXP_SPACE (ревизия $EXP_REV), $applied"
+    fi
     if [[ -n "${C[TELEPORT_PROXY]}" ]]; then
         local host node; host="$(proxy_host "$(proxy_with_port "${C[TELEPORT_PROXY]}")")"
         node="$(nodename 2>/dev/null || echo '?')"
@@ -766,6 +1114,9 @@ case "${1:-}" in
     apply) shift; cmd_apply "$@" ;;
     scrub-token) need_root; scrub_token ;;
     os-logins) cmd_os_logins; exit 0 ;;
+    set-managed) shift; cmd_set_managed "$@" ;;
+    pull) cmd_pull ;;
+    labels-enable) shift; cmd_labels_enable "$@" ;;
     -h|--help|help|"") sed -n '2,${/^#/!q; s/^# \{0,1\}//; p}' "$0" ;;
-    *) die "неизвестная команда '$1' (join|set|leave|status|render|apply|os-logins)" ;;
+    *) die "неизвестная команда '$1' (join|set|leave|status|render|apply|os-logins|set-managed|pull|labels-enable)" ;;
 esac

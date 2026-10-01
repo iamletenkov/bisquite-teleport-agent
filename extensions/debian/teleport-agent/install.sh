@@ -20,6 +20,12 @@
 #                                  channel when the tarball comes from a
 #                                  mirror). A rebuilt fork differs from the
 #                                  vanilla tarball: pin its hash here.
+#
+# The same script updates the extension on a running robot: update.sh lays
+# the archive out and calls it with TELEPORT_VERSION = the installed agent,
+# so the binary of the running agent is not replaced, and with
+# BISQUITE_TELEPORT_UPDATE=1 (a registration in /var/lib/teleport is
+# expected there). BISQUITE_TELEPORT_ROOT — a scratch root for the tests.
 
 # Download source — pure functions; tools/test-conf.sh sources this file and
 # calls them, nothing below the guard runs then.
@@ -52,6 +58,8 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
 log_info(){ >&2 echo -e "${GREEN}[INFO]${NC} teleport-agent: $*"; }
 log_error(){ >&2 echo -e "${RED}[ERROR]${NC} teleport-agent: $*"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${BISQUITE_TELEPORT_ROOT:-}"
+export BISQUITE_CONF_ROOT="${BISQUITE_CONF_ROOT:-$ROOT}"
 [[ -f "$SCRIPT_DIR/lib/bisquite-conf" ]] || { log_error "рядом нет lib/bisquite-conf — сборка не доставила lib/ источника"; exit 1; }
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/lib/bisquite-conf"
@@ -67,8 +75,10 @@ TELEPORT_SHA256="${TELEPORT_SHA256:-}"
 DPKG_ARCH="$(dpkg --print-architecture)"
 ARCH="$(teleport_arch "$DPKG_ARCH")" || { log_error "архитектура $DPKG_ARCH не поддерживается"; exit 1; }
 
-for f in bisquite-teleport knobs knobs.apply teleport.service bisquite-teleport-apps.path bisquite-teleport-apps.service \
-         bisquite-teleport-token.path bisquite-teleport-token.service; do
+UNITS=(teleport.service bisquite-teleport-apps.path bisquite-teleport-apps.service
+       bisquite-teleport-token.path bisquite-teleport-token.service
+       bisquite-teleport-labels.service bisquite-teleport-labels.timer)
+for f in bisquite-teleport knobs knobs.apply "${UNITS[@]}"; do
     [[ -f "$SCRIPT_DIR/$f" ]] || { log_error "рядом нет $f"; exit 1; }
 done
 
@@ -81,7 +91,8 @@ URL="$(teleport_url "$TELEPORT_VERSION" "$ARCH" "$TELEPORT_MIRROR")"
 SHA256_URL="$(teleport_sha256_url "$TELEPORT_VERSION" "$ARCH")"
 SHA256_FROM_CDN=0
 
-if [[ -x /usr/local/bin/teleport ]] && /usr/local/bin/teleport version 2>/dev/null | grep -q "v${TELEPORT_VERSION} "; then
+BIN="$ROOT/usr/local/bin/teleport"
+if [[ -x "$BIN" ]] && "$BIN" version 2>/dev/null | grep -q "v${TELEPORT_VERSION} "; then
     log_info "Teleport ${TELEPORT_VERSION} уже установлен"
 else
     WORK="$(mktemp -d /var/tmp/teleport-agent.XXXXXX)"
@@ -111,34 +122,38 @@ else
     # Only the agent: tsh, tctl, tbot and teleport-update are ~370 MB more and
     # a node needs none of them.
     tar -xzf "$WORK/$FILE" -C "$WORK" teleport/teleport
-    install -m 0755 "$WORK/teleport/teleport" /usr/local/bin/teleport
-    /usr/local/bin/teleport version | grep -q "v${TELEPORT_VERSION} " || { log_error "teleport version не совпал с ${TELEPORT_VERSION}"; exit 1; }
-    log_info "установлен $(/usr/local/bin/teleport version | head -1)"
+    install -d -m 0755 "$ROOT/usr/local/bin"
+    install -m 0755 "$WORK/teleport/teleport" "$BIN"
+    "$BIN" version | grep -q "v${TELEPORT_VERSION} " || { log_error "teleport version не совпал с ${TELEPORT_VERSION}"; exit 1; }
+    log_info "установлен $("$BIN" version | head -1)"
 fi
 
 # A link, not a copy: the CLI finds lib/bisquite-conf next to itself through
 # `readlink -f`, i.e. always the library of the build that installed it.
 chmod +x "$SCRIPT_DIR/bisquite-teleport"
-install -d -m 0755 /usr/local/sbin
-ln -sfn "$SCRIPT_DIR/bisquite-teleport" /usr/local/sbin/bisquite-teleport
-for u in teleport.service bisquite-teleport-apps.path bisquite-teleport-apps.service \
-         bisquite-teleport-token.path bisquite-teleport-token.service; do
-    install -m 0644 "$SCRIPT_DIR/$u" "/etc/systemd/system/$u"
+install -d -m 0755 "$ROOT/usr/local/sbin" "$ROOT/etc/systemd/system"
+ln -sfn "$SCRIPT_DIR/bisquite-teleport" "$ROOT/usr/local/sbin/bisquite-teleport"
+for u in "${UNITS[@]}"; do
+    install -m 0644 "$SCRIPT_DIR/$u" "$ROOT/etc/systemd/system/$u"
 done
 # Path units always on (cheap, no-ops until joined); the agent itself is
-# enabled by `join`. Links, not `systemctl enable`: no systemd in the build.
-install -d /etc/systemd/system/paths.target.wants
-ln -sf /etc/systemd/system/bisquite-teleport-apps.path /etc/systemd/system/paths.target.wants/
-ln -sf /etc/systemd/system/bisquite-teleport-token.path /etc/systemd/system/paths.target.wants/
+# enabled by `join`, the labels timer by `labels-enable` (or update.sh).
+# Links, not `systemctl enable`: no systemd in the build.
+install -d "$ROOT/etc/systemd/system/paths.target.wants"
+ln -sf /etc/systemd/system/bisquite-teleport-apps.path "$ROOT/etc/systemd/system/paths.target.wants/"
+ln -sf /etc/systemd/system/bisquite-teleport-token.path "$ROOT/etc/systemd/system/paths.target.wants/"
 
 # Settings file through the library: created once, never rewritten — a
 # rebuild on top of an image keeps what `join`/`set` wrote. No --env: the image
 # stays neutral to the cluster, env and apps are given on the device.
-install -d -m 0755 /etc/bisquite/teleport/apps.d
+install -d -m 0755 "$ROOT/etc/bisquite/teleport/apps.d"
 conf_init teleport "$SCRIPT_DIR/knobs" || { log_error "/etc/bisquite/teleport/config не записан"; exit 1; }
-install -d -m 0750 /var/lib/teleport
+install -d -m 0750 "$ROOT/var/lib/teleport"
 
-if [[ -s /var/lib/teleport/host_uuid ]] && [[ ! -d /run/systemd/system ]]; then
+# In a build a registration would make every copy of the image one node; on a
+# running robot (update.sh) it is the robot's own.
+if [[ -s "$ROOT/var/lib/teleport/host_uuid" && "${BISQUITE_TELEPORT_UPDATE:-}" != 1 ]] \
+   && [[ -n "$ROOT" || ! -d /run/systemd/system ]]; then
     log_error "в /var/lib/teleport уже есть регистрация — образ стал бы одной нодой на все копии"
     exit 1
 fi

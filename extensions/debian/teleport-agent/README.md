@@ -8,6 +8,12 @@
 > в `/var/lib/bisquite/teleport`.
 > Нужен bisquite с поддержкой `layout: 2`.
 
+> **С 2.5.0 — метки `space` и `env` с портала.** `labels-enable` включает
+> таймер, который раз в минуту забирает с портала (Stvor) метки `space` и
+> `env` и применяет их одним перезапуском агента — узел и все приложения
+> меняются вместе (см. «Метки с портала»). `join` не изменился. Роботы на
+> 2.4.0 и раньше обновляются без пересборки образа — `update.sh` из архива.
+
 > **С 2.4.0 — join `bound_keypair` и Teleport 18.10.0 по умолчанию.**
 > `TELEPORT_JOIN_METHOD=bound_keypair`: имя токена плюс одноразовый секрет
 > регистрации, дальше агент подключается связанным ключом из
@@ -161,6 +167,9 @@ bisquite-teleport join KEY=VALUE…   зарегистрироваться (пе
 bisquite-teleport set KEY=VALUE…    env, метки, приложения — без переподключения
 bisquite-teleport leave             агент выключен, регистрация стёрта
 bisquite-teleport status            что настроено и что опубликовано
+bisquite-teleport labels-enable URL=…    метки с портала: токен со stdin, таймер
+bisquite-teleport pull              один тик: забрать метки и применить (зовёт таймер)
+bisquite-teleport set-managed env=… space=…   метки портала одним перезапуском
 ```
 
 ### join
@@ -216,6 +225,134 @@ reload в очередь без ожидания — `set` бывает и вн�
 
 Запись ноды в кластере сама не удаляется — у ноды нет на это прав. Она
 исчезнет по истечении heartbeat, либо удаляется в админке.
+
+## Метки с портала
+
+Портал (Stvor) — источник правды о том, в каком пространстве робот. Он
+управляет ровно двумя метками: `space` (один элемент `TELEPORT_LABELS`) и
+`env` (`TELEPORT_ENV`). Прочие метки оператора (`site=lab` и т. п.) клиент
+не трогает. Перенос робота на портале — двухфазный: портал запоминает цель,
+робот забирает её и применяет, сверка инвентаря завершает перенос, когда
+новые метки несут и узел, и **все** его приложения.
+
+### Включение
+
+На портале — «Выпустить токен меток» на карточке робота; он показывает
+команду. На роботе:
+
+```bash
+read -rs T && printf '%s' "$T" | sudo bisquite-teleport labels-enable URL=https://<портал>/robot-api/v1/labels; unset T
+```
+
+или из `firstboot-commands` — **вторым** вызовом после `join`, со своим
+`printf … |` и `|| true` (на образе старше 2.5.0 упадёт только он, регистрация
+пройдёт):
+
+```yaml
+firstboot-commands:
+  - "echo '<секрет>' | bisquite-teleport join TELEPORT_PROXY=… TELEPORT_JOIN_METHOD=bound_keypair TELEPORT_TOKEN=<имя> TELEPORT_REGISTRATION_SECRET=- TELEPORT_ENV=dst"
+  - "printf '%s' '<токен меток>' | bisquite-teleport labels-enable URL=https://<портал>/robot-api/v1/labels || true"
+```
+
+`labels-enable`:
+
+1. проверяет адрес — ровно `https://<хост>[:порт]/robot-api/v1/labels`;
+2. читает токен со stdin (43 знака `[A-Za-z0-9_-]`; пробелы и перевод строки
+   по краям отбрасываются) и кладёт в `/etc/bisquite/teleport/labels-token`
+   (0600). **Токен не ручка:** ручки печатает `status`, а в файле ручек
+   токена нет; в argv (`curl` получает заголовок из файла, `-H @файл`) и в
+   журнал он не попадает;
+3. пишет ручку `TELEPORT_LABELS_URL` (другой адрес — запомненный ответ
+   прежнего портала стирается);
+4. `systemctl enable --now bisquite-teleport-labels.timer` и сразу один `pull`.
+
+Код возврата — код этого `pull`. Повтор `labels-enable` с новым токеном
+(перевыпуск на портале) — тот же способ.
+
+### Тик таймера — `pull`
+
+`bisquite-teleport-labels.timer`: `OnBootSec=1min`, `OnUnitActiveSec=1min`,
+`RandomizedDelaySec=20s`; служба — oneshot с
+`ConditionPathExists=/etc/bisquite/teleport/labels-token`.
+
+```
+GET /robot-api/v1/labels
+  Authorization: Bearer <токен>
+  If-None-Match: "<ревизия>"        # если ответ уже запомнен
+  X-Applied-Revision: <ревизия>     # только если она действует (ниже)
+200 {"labels":{"env":"<env>","space":"<код>"},"revision":"<16 hex>"}
+304 — без тела
+```
+
+- **Ответ проверяется целиком до записи** (внешний ввод): ровно эти ключи в
+  этом порядке, каждый один раз; значения — `^[a-z0-9][a-z0-9-]{0,62}$`,
+  ревизия — 16 hex; тело не длиннее 4 КБ. Иначе — отказ, код 1, ничего не
+  записано.
+- **Сверяется состояние, а не ревизия.** Последний ответ портала хранится в
+  `/var/lib/bisquite/teleport/labels-expected`; на каждом тике (и на 304
+  тоже) он сравнивается с фактическими `TELEPORT_ENV` и `space` в
+  `TELEPORT_LABELS`. Расходятся — `set-managed`. Так сами исправляются ручной
+  `set TELEPORT_LABELS=…`, повторный firstboot и неудавшийся перезапуск.
+  ETag/304 только экономят тело ответа.
+- **`X-Applied-Revision` сообщается только о том, что действует:** ручки
+  несут ожидаемые метки, агент активен, ревизия записана в `labels-applied`
+  после проверки `is-active`. Портал узнаёт об этом на следующем тике.
+- Сеть, 401, 429, 5xx — одна строка в журнале, код 0, ничего не тронуто:
+  повтор — следующий тик. 401 — токен перевыпущен или робот списан; лечится
+  новым токеном и `labels-enable`.
+- Агент не поднялся после перезапуска — код 1, ревизия не отмечена
+  применённой; следующий тик перезапускает снова.
+
+### set-managed
+
+`set-managed env=<v> space=<v>` (любой из двух или оба; другие ключи —
+отказ; значение — тот же шаблон). `space` заменяет элемент `space=` в
+`TELEPORT_LABELS` на его месте (или дописывается в конец), `env` — в
+`TELEPORT_ENV`. Пишет библиотека **без хука `apply`**, затем
+`systemctl restart teleport.service` и ожидание `is-active` до 30 с
+(`BISQUITE_TELEPORT_RESTART_TIMEOUT`); не поднялся — код 1. Ничего не
+изменилось — `systemctl` не зовётся вовсе. Кластер не задан или systemd не
+запущен — только запись.
+
+**Перезапуск, а не reload.** HUP оставил бы открытыми SSH-сессии людей
+прежнего пространства, а приложения уже проверялись бы по новым меткам —
+SSH и приложения оказались бы в разных пространствах. Перезапуск рвёт
+открытые сессии, робот недоступен 5–10 секунд, узел и приложения переезжают
+одновременно. HUP (`set`, `apps.d`) остаётся для прочих правок.
+
+### Обновление на уже работающих роботах — `update.sh`
+
+Робот, прошитый образом с teleport-agent ≤ 2.4.0, получает 2.5.0 без
+пересборки образа и без новой регистрации. Архив —
+
+```bash
+git archive <коммит> extensions/debian/teleport-agent lib | gzip -n > teleport-agent.tar.gz
+```
+
+(портал отдаёт его с sha256 рядом). На роботе, после сверки суммы:
+
+```bash
+mkdir /tmp/ta && tar -xzf teleport-agent.tar.gz -C /tmp/ta
+sudo bash /tmp/ta/extensions/debian/teleport-agent/update.sh
+```
+
+`update.sh`:
+
+1. отказывает, если агент Teleport не установлен (`/usr/local/bin/teleport
+   version` молчит) или скрипт запущен из установленного каталога;
+2. кладёт `lib/` в `/opt/bisquite/lib/<sha256>/` — отпечаток тот же, что
+   считает сборка bisquite, одинаковый `lib` не дублируется;
+3. заменяет `/opt/bisquite/teleport-agent/` целиком (файлы прежней версии не
+   остаются), ссылка `lib` → `/opt/bisquite/lib/<sha256>`;
+4. зовёт `install.sh` нового каталога с `TELEPORT_VERSION` = версия
+   установленного агента — бинарь работающего агента не заменяется и не
+   скачивается; ссылки CLI и схемы, юниты; файл ручек не переписывается;
+5. `systemctl daemon-reload`, `enable --now bisquite-teleport-labels.timer`
+   (без токена служба не запускается). Агент **не** перезапускается.
+
+Робот прежней раскладки (`/opt/vmsetup/teleport-agent`) переезжает в
+`/opt/bisquite`; старый каталог остаётся на диске, CLI и схема — уже из
+нового. Дальше — `labels-enable`.
 
 ## Метка os_logins
 
@@ -393,14 +530,19 @@ https на петле публикуется с `insecure_skip_verify`: у code-
 | `/var/lib/teleport/` | 0750 | регистрация агента; у `bound_keypair` — и связанный ключ (`proc/`) |
 | `/var/lib/bisquite/teleport/` | 0700 | `rollback` прежней регистрации на время `join` |
 | `/var/lib/bisquite/teleport/registration-secret` | 0600 | секрет `bound_keypair` до регистрации |
+| `/etc/bisquite/teleport/labels-token` | 0600 | токен меток портала; пишет `labels-enable` |
+| `/var/lib/bisquite/teleport/labels-expected` | 0600 | последний ответ портала: `revision=`, `env=`, `space=` |
+| `/var/lib/bisquite/teleport/labels-applied` | 0600 | ревизия, которая действует (агент активен с этими метками) |
 | `teleport.service` | | агент; включает `join` |
 | `bisquite-teleport-apps.path` | | `apps.d` → reload |
 | `bisquite-teleport-token.path` | | появился `host_uuid` → токен (`token`) или секрет регистрации (`bound_keypair`) стёрт |
+| `bisquite-teleport-labels.{service,timer}` | | метки с портала раз в минуту; включает `labels-enable` или `update.sh`, на сборке выключен |
 
 ## Диагностика
 
 ```bash
 sudo bisquite-teleport status
 journalctl -u teleport -f
+journalctl -u bisquite-teleport-labels   # тики меток: ни токена, ни тела ответа там нет
 getent hosts x.<нода>.teleport.<домен>   # DNS для адресов приложений
 ```
