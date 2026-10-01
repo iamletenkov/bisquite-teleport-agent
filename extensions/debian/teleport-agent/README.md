@@ -223,6 +223,10 @@ reload в очередь без ожидания — `set` бывает и вн�
 
 ### leave
 
+Выключает и таймер меток (`disable --now`), стирает токен меток, запомненный
+ответ портала, `labels-applied`, маркер перезапуска и ручку
+`TELEPORT_LABELS_URL`.
+
 Запись ноды в кластере сама не удаляется — у ноды нет на это прав. Она
 исчезнет по истечении heartbeat, либо удаляется в админке.
 
@@ -258,13 +262,19 @@ firstboot-commands:
 
 1. проверяет адрес — ровно `https://<хост>[:порт]/robot-api/v1/labels`;
 2. читает токен со stdin (43 знака `[A-Za-z0-9_-]`; пробелы и перевод строки
-   по краям отбрасываются) и кладёт в `/etc/bisquite/teleport/labels-token`
-   (0600). **Токен не ручка:** ручки печатает `status`, а в файле ручек
+   по краям отбрасываются) и кладёт **вместе с адресом** в
+   `/etc/bisquite/teleport/labels-token` (0600, root; строки `url=…` и
+   `token=…`). **Токен не ручка:** ручки печатает `status`, а в файле ручек
    токена нет; в argv (`curl` получает заголовок из файла, `-H @файл`) и в
    журнал он не попадает;
-3. пишет ручку `TELEPORT_LABELS_URL` (другой адрес — запомненный ответ
+3. пишет ручку `TELEPORT_LABELS_URL` — она `ro:`: `set` и `join` её не
+   принимают, пишет только `labels-enable` (другой адрес — запомненный ответ
    прежнего портала стирается);
 4. `systemctl enable --now bisquite-teleport-labels.timer` и сразу один `pull`.
+
+`labels-enable`, `set-managed` и `pull` идут под одной блокировкой
+(`flock` на `/var/lib/bisquite/teleport/.labels.lock`): тик таймера,
+пришедший во время ручной команды, пропускается.
 
 Код возврата — код этого `pull`. Повтор `labels-enable` с новым токеном
 (перевыпуск на портале) — тот же способ.
@@ -273,16 +283,25 @@ firstboot-commands:
 
 `bisquite-teleport-labels.timer`: `OnBootSec=1min`, `OnUnitActiveSec=1min`,
 `RandomizedDelaySec=20s`; служба — oneshot с
-`ConditionPathExists=/etc/bisquite/teleport/labels-token`.
+`ConditionPathExists=/etc/bisquite/teleport/labels-token` и
+`TimeoutStartSec=5min`.
+
+Контракт с порталом — точно:
 
 ```
-GET /robot-api/v1/labels
+GET <TELEPORT_LABELS_URL>                 # https://<хост>[:порт]/robot-api/v1/labels
   Authorization: Bearer <токен>
-  If-None-Match: "<ревизия>"        # если ответ уже запомнен
-  X-Applied-Revision: <ревизия>     # только если она действует (ниже)
-200 {"labels":{"env":"<env>","space":"<код>"},"revision":"<16 hex>"}
+  If-None-Match: "<ревизия>"              # если ответ уже запомнен
+  X-Applied-Revision: <ревизия>           # только вместе с If-None-Match той же ревизии и только когда
+                                          # ручки равны ожидаемым, маркера перезапуска нет и агент активен
+200 {"labels":{"env":"<v>","space":"<v>"},"revision":"<16 hex>"}   # компактный JSON, ключи в этом порядке
 304 — без тела
+401, 429, 3xx, 5xx, сеть — тихий повтор на следующем тике (редиректам curl не следует)
 ```
+
+Перед запросом `pull` проверяет файл токена: права не шире 0600, владелец
+root, адрес в нём равен `TELEPORT_LABELS_URL` — иначе отказ (код 1) и токен
+никуда не уходит.
 
 - **Ответ проверяется целиком до записи** (внешний ввод): ровно эти ключи в
   этом порядке, каждый один раз; значения — `^[a-z0-9][a-z0-9-]{0,62}$`,
@@ -294,10 +313,18 @@ GET /robot-api/v1/labels
   `TELEPORT_LABELS`. Расходятся — `set-managed`. Так сами исправляются ручной
   `set TELEPORT_LABELS=…`, повторный firstboot и неудавшийся перезапуск.
   ETag/304 только экономят тело ответа.
+- **Перезапуск подтверждается.** До записи ручек `set-managed` кладёт маркер
+  `/var/lib/bisquite/teleport/labels-restart-pending` и снимает его только
+  после подтверждённого перезапуска: `systemctl restart` вернул 0, у
+  `teleport.service` новый `InvocationID` и он `active`. Пока маркер есть,
+  каждый тик перезапускает агент — даже если тот активен (он мог остаться
+  со старым `teleport.yaml`, когда `restart` упал или тик убили между
+  записью и перезапуском), ревизия не отмечается применённой и
+  `X-Applied-Revision` не уходит.
 - **`X-Applied-Revision` сообщается только о том, что действует:** ручки
-  несут ожидаемые метки, агент активен, ревизия записана в `labels-applied`
-  после проверки `is-active`. Портал узнаёт об этом на следующем тике.
-- Сеть, 401, 429, 5xx — одна строка в журнале, код 0, ничего не тронуто:
+  несут ожидаемые метки, маркера нет, агент активен, ревизия записана в
+  `labels-applied`. Портал узнаёт об этом на следующем тике.
+- Сеть, 401, 429, 3xx, 5xx — одна строка в журнале, код 0, ничего не тронуто:
   повтор — следующий тик. 401 — токен перевыпущен или робот списан; лечится
   новым токеном и `labels-enable`.
 - Агент не поднялся после перезапуска — код 1, ревизия не отмечена
@@ -309,8 +336,9 @@ GET /robot-api/v1/labels
 отказ; значение — тот же шаблон). `space` заменяет элемент `space=` в
 `TELEPORT_LABELS` на его месте (или дописывается в конец), `env` — в
 `TELEPORT_ENV`. Пишет библиотека **без хука `apply`**, затем
-`systemctl restart teleport.service` и ожидание `is-active` до 30 с
-(`BISQUITE_TELEPORT_RESTART_TIMEOUT`); не поднялся — код 1. Ничего не
+`systemctl restart teleport.service` и ожидание нового `InvocationID` в
+состоянии `active` до 30 с (`BISQUITE_TELEPORT_RESTART_TIMEOUT`); не
+подтвердилось — код 1, маркер остаётся. Ничего не
 изменилось — `systemctl` не зовётся вовсе. Кластер не задан или systemd не
 запущен — только запись.
 
@@ -344,11 +372,12 @@ sudo bash /tmp/ta/extensions/debian/teleport-agent/update.sh
    считает сборка bisquite, одинаковый `lib` не дублируется;
 3. заменяет `/opt/bisquite/teleport-agent/` целиком (файлы прежней версии не
    остаются), ссылка `lib` → `/opt/bisquite/lib/<sha256>`;
-4. зовёт `install.sh` нового каталога с `TELEPORT_VERSION` = версия
-   установленного агента — бинарь работающего агента не заменяется и не
-   скачивается; ссылки CLI и схемы, юниты; файл ручек не переписывается;
-5. `systemctl daemon-reload`, `enable --now bisquite-teleport-labels.timer`
-   (без токена служба не запускается). Агент **не** перезапускается.
+4. зовёт `install.sh` нового каталога с `BISQUITE_TELEPORT_UPDATE=1`: бинарь
+   установленного агента не трогается вовсе (форк с суффиксом версии вроде
+   `v18.10.0-oidc` тоже); ссылки CLI и схемы, юниты; файл ручек не
+   переписывается. Упал `install.sh` — прежний каталог возвращается, код ≠ 0;
+5. `systemctl daemon-reload`; таймер `enable --now` — только если токен меток
+   уже есть, иначе его включит `labels-enable`. Агент **не** перезапускается.
 
 Робот прежней раскладки (`/opt/vmsetup/teleport-agent`) переезжает в
 `/opt/bisquite`; старый каталог остаётся на диске, CLI и схема — уже из
@@ -530,9 +559,10 @@ https на петле публикуется с `insecure_skip_verify`: у code-
 | `/var/lib/teleport/` | 0750 | регистрация агента; у `bound_keypair` — и связанный ключ (`proc/`) |
 | `/var/lib/bisquite/teleport/` | 0700 | `rollback` прежней регистрации на время `join` |
 | `/var/lib/bisquite/teleport/registration-secret` | 0600 | секрет `bound_keypair` до регистрации |
-| `/etc/bisquite/teleport/labels-token` | 0600 | токен меток портала; пишет `labels-enable` |
+| `/etc/bisquite/teleport/labels-token` | 0600 | `url=…` и `token=…` меток портала; пишет `labels-enable` |
 | `/var/lib/bisquite/teleport/labels-expected` | 0600 | последний ответ портала: `revision=`, `env=`, `space=` |
 | `/var/lib/bisquite/teleport/labels-applied` | 0600 | ревизия, которая действует (агент активен с этими метками) |
+| `/var/lib/bisquite/teleport/labels-restart-pending` | 0600 | ручки меток записаны, перезапуск ещё не подтверждён |
 | `teleport.service` | | агент; включает `join` |
 | `bisquite-teleport-apps.path` | | `apps.d` → reload |
 | `bisquite-teleport-token.path` | | появился `host_uuid` → токен (`token`) или секрет регистрации (`bound_keypair`) стёрт |

@@ -8,6 +8,8 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# A restart waits up to 30 s for the agent; a stuck curl is cut at 30 s.
+TimeoutStartSec=5min
 # Network and HTTP errors end with code 0 and one journal line: the next tick
 # is the retry. A refused answer or an agent that did not come up fails.
 ExecStart=/usr/local/sbin/bisquite-teleport pull

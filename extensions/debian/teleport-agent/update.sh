@@ -88,8 +88,20 @@ log "teleport-agent: было ${previous:-?}, ставлю ${version:-?}; аге
 digest="$(lib_digest "$SRC/lib")"
 [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "отпечаток lib/ не посчитан"
 LIB_DIR="$GUEST/lib/$digest"
-NEW=""; OLD=""; LIB_NEW=""
-cleanup(){ rm -r -f -- ${NEW:+"$NEW"} ${OLD:+"$OLD"} ${LIB_NEW:+"$LIB_NEW"}; }
+NEW=""; OLD=""; LIB_NEW=""; SWAPPED=0; DONE=0
+# On any failure after the swap the previous directory comes back: a robot
+# is never left with half an update. Without a previous one (the /opt/vmsetup
+# layout) the new directory goes away again.
+cleanup(){
+    if (( SWAPPED && ! DONE )); then
+        rm -r -f -- "$TARGET"
+        if [[ -n "$OLD" && -e "$OLD" ]]; then
+            mv -T -- "$OLD" "$TARGET" && log "прежний каталог $TARGET возвращён"
+        fi
+        OLD=""
+    fi
+    rm -r -f -- ${NEW:+"$NEW"} ${OLD:+"$OLD"} ${LIB_NEW:+"$LIB_NEW"}
+}
 trap cleanup EXIT
 install -d -m 0755 "$GUEST" "$GUEST/lib"
 if [[ ! -d "$LIB_DIR" ]]; then
@@ -120,19 +132,22 @@ if [[ -e "$TARGET" || -L "$TARGET" ]]; then
     mv -T -- "$TARGET" "$OLD"
 fi
 mv -T -- "$NEW" "$TARGET"
-NEW=""
+NEW=""; SWAPPED=1
 
 # 3. install.sh of the new version: links, units, settings registration.
 TELEPORT_VERSION="$agent" BISQUITE_TELEPORT_UPDATE=1 bash "$TARGET/install.sh" \
-    || die "install.sh не прошёл — каталог расширения уже новый, повторите update.sh"
+    || die "install.sh не прошёл — прежний каталог расширения возвращается"
+DONE=1
 if [[ -d "$LEGACY" ]]; then
     log "прежняя раскладка $LEGACY оставлена на диске; CLI и схема — теперь из $TARGET"
 fi
 
-# 4. systemd picks up the units; the timer does nothing until labels-enable
-#    writes the token (ConditionPathExists).
+# 4. systemd picks up the units. The timer is enabled here only for a robot
+#    that already has a labels token; otherwise labels-enable enables it.
 if has_systemd; then
     systemctl daemon-reload
-    systemctl enable --now "$TIMER" >/dev/null 2>&1 || die "$TIMER не включён"
+    if [[ -f "$ROOT/etc/bisquite/teleport/labels-token" ]]; then
+        systemctl enable --now "$TIMER" >/dev/null 2>&1 || die "$TIMER не включён"
+    fi
 fi
 log "готово: teleport-agent ${version:-?}. Автоприменение меток — printf '%s' <токен> | bisquite-teleport labels-enable URL=https://<портал>/robot-api/v1/labels"

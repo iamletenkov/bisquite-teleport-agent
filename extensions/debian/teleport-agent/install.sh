@@ -92,7 +92,11 @@ SHA256_URL="$(teleport_sha256_url "$TELEPORT_VERSION" "$ARCH")"
 SHA256_FROM_CDN=0
 
 BIN="$ROOT/usr/local/bin/teleport"
-if [[ -x "$BIN" ]] && "$BIN" version 2>/dev/null | grep -q "v${TELEPORT_VERSION} "; then
+if [[ "${BISQUITE_TELEPORT_UPDATE:-}" == 1 && -x "$BIN" ]]; then
+    # Updating a running robot: its agent may be a fork with a version suffix
+    # (v18.10.0-oidc) that no version string here matches — never replace it.
+    log_info "обновление расширения: агент $("$BIN" version 2>/dev/null | head -1) не трогаю"
+elif [[ -x "$BIN" ]] && "$BIN" version 2>/dev/null | grep -q "v${TELEPORT_VERSION} "; then
     log_info "Teleport ${TELEPORT_VERSION} уже установлен"
 else
     WORK="$(mktemp -d /var/tmp/teleport-agent.XXXXXX)"

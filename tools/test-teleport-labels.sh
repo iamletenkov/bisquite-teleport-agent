@@ -35,7 +35,10 @@ REV_C=fedcba9876543210
 # FAKE: where the fakes keep their logs and switches.
 #   systemctl.log     every systemctl call, one per line
 #   active            exists — teleport.service is active
-#   start-fails       exists — `restart teleport.service` fails
+#   start-fails       exists — `restart teleport.service` fails, the agent is down
+#   restart-fails-active  exists — `restart` fails, the old agent keeps running
+#   restart-noop      exists — `restart` says 0 but nothing restarts
+#   invocation        InvocationID of teleport.service (changes on every start)
 #   portal.code       HTTP code of the next answers (200, 304, 401, …; down — no network)
 #   portal.body       body of the answer
 #   curl.argv         argv of every curl call
@@ -60,11 +63,15 @@ echo "$*" >> "$FAKE/systemctl.log"
 case "${1:-}" in
     is-active) [[ -f "$FAKE/active" ]]; exit ;;
     is-system-running) echo running; exit 0 ;;
+    show) cat "$FAKE/invocation" 2>/dev/null; exit 0 ;;
     restart)
         if [[ "${2:-}" == teleport.service ]]; then
+            [[ -f "$FAKE/restart-fails-active" ]] && exit 1
+            [[ -f "$FAKE/restart-noop" ]] && exit 0
             rm -f "$FAKE/active"
             [[ -f "$FAKE/start-fails" ]] && exit 1
             "$FAKE_TP" render 2>/dev/null || exit 1
+            echo "inv-$RANDOM$RANDOM" > "$FAKE/invocation"
             touch "$FAKE/active"
         fi ;;
 esac
@@ -119,7 +126,7 @@ stage(){
 lib(){ bash -c 'set -euo pipefail; source "$1"; shift; "$@"' _ "$REPO/lib/bisquite-conf" "$@"; }
 tp(){ bash "$STAGED/bisquite-teleport" "$@"; }
 get(){ lib conf_get teleport "$1"; }
-syslog(){ grep -v '^is-active' "$FAKE/systemctl.log" 2>/dev/null; }
+syslog(){ grep -v -e '^is-active' -e '^show ' "$FAKE/systemctl.log" 2>/dev/null; }
 reset_logs(){ rm -f "$FAKE/systemctl.log" "$FAKE/curl.argv" "$FAKE/curl.req"; }
 app_decl(){
     local n="$1" f; shift
@@ -140,7 +147,8 @@ robot(){
     printf '#!/bin/sh\ntouch "%s/hook-called"\n' "$FAKE" > "$ROOT/opt/bisquite/knobs/teleport.apply"
     chmod +x "$ROOT/opt/bisquite/knobs/teleport.apply"
     tp render 2>/dev/null || bad "render исходного конфига"
-    touch "$FAKE/active"
+    touch "$FAKE/active"; echo inv-initial > "$FAKE/invocation"
+    STATE="$ROOT/var/lib/bisquite/teleport"
     reset_logs
 }
 cfg_snapshot(){ cat "$ROOT/etc/bisquite/teleport/config"; }
@@ -150,6 +158,12 @@ portal(){ # portal <code> [env space revision]
         printf '{"labels":{"env":"%s","space":"%s"},"revision":"%s"}' "$2" "$3" "$4" > "$FAKE/portal.body"
     fi
 }
+# The token file the way labels-enable writes it: address and token, 0600.
+token_file(){ # token_file [url]
+    printf 'url=%s\ntoken=%s\n' "${1:-$URL}" "$TOKEN" > "$ROOT/etc/bisquite/teleport/labels-token"
+    chmod 0600 "$ROOT/etc/bisquite/teleport/labels-token"
+}
+labels_url(){ lib conf_set teleport --allow-ro "TELEPORT_LABELS_URL=$1"; }
 enable_labels(){ printf '%s' "$TOKEN" | tp labels-enable "URL=$URL" 2>/dev/null; }
 yaml_spaces(){ grep -c '"space": "'"$1"'"' "$ROOT/etc/teleport.yaml"; }
 
@@ -240,7 +254,7 @@ check_not "labels-enable: после отказов — нет запроса к
 out="$(printf '%s\n' "$TOKEN" | tp labels-enable "URL=$URL" 2>&1)"; rc=$?
 eq "labels-enable: код 0" 0 "$rc"
 eq "labels-enable: файл токена 0600" 600 "$(stat -c %a "$ROOT/etc/bisquite/teleport/labels-token")"
-eq "labels-enable: в файле токен без перевода строки вокруг" "$TOKEN" "$(cat "$ROOT/etc/bisquite/teleport/labels-token")"
+eq "labels-enable: в файле адрес и токен (без пробелов вокруг)" $'url='"$URL"$'\ntoken='"$TOKEN" "$(cat "$ROOT/etc/bisquite/teleport/labels-token")"
 eq "labels-enable: ручка TELEPORT_LABELS_URL" "$URL" "$(get TELEPORT_LABELS_URL)"
 check "labels-enable: таймер enable --now" grep -qx 'enable --now bisquite-teleport-labels.timer' "$FAKE/systemctl.log"
 check "labels-enable: один pull сразу — запрос к порталу" grep -q "^URL $URL\$" "$FAKE/curl.req"
@@ -259,8 +273,7 @@ check_not "status: временных файлов запроса не оста�
 # ===========================================================================
 echo "== pull =="
 robot
-printf '%s' "$TOKEN" > "$ROOT/etc/bisquite/teleport/labels-token"; chmod 0600 "$ROOT/etc/bisquite/teleport/labels-token"
-lib conf_set teleport "TELEPORT_LABELS_URL=$URL"
+token_file; labels_url "$URL"
 STATE="$ROOT/var/lib/bisquite/teleport"
 portal 200 prod sp-bbbbbbbb "$REV_B"
 check "pull: 200 — код 0" tp pull 2>/dev/null
@@ -356,19 +369,91 @@ eq "pull: следующий тик — ревизия отмечена" "$REV_B
 
 # Not enabled: no token or no URL — nothing happens, code 0.
 robot
-lib conf_set teleport "TELEPORT_LABELS_URL=$URL"
+labels_url "$URL"
 check "pull: без токена — код 0" tp pull 2>/dev/null
 check_not "pull: без токена — запроса нет" test -e "$FAKE/curl.argv"
 robot
-printf '%s' "$TOKEN" > "$ROOT/etc/bisquite/teleport/labels-token"; chmod 0600 "$ROOT/etc/bisquite/teleport/labels-token"
+token_file
 check "pull: без URL — код 0" tp pull 2>/dev/null
 check_not "pull: без URL — запроса нет" test -e "$FAKE/curl.argv"
-lib conf_set teleport "TELEPORT_LABELS_URL=$URL"
-printf 'bad token\n' > "$ROOT/etc/bisquite/teleport/labels-token"
+labels_url "$URL"
+printf 'url=%s\ntoken=bad token\n' "$URL" > "$ROOT/etc/bisquite/teleport/labels-token"
 check_not "pull: испорченный файл токена — отказ" tp pull 2>/dev/null
 check_not "pull: испорченный файл токена — запроса нет" test -e "$FAKE/curl.argv"
+token_file; chmod 0644 "$ROOT/etc/bisquite/teleport/labels-token"
+check_not "pull: файл токена шире 0600 — отказ" tp pull 2>/dev/null
+check_not "pull: файл токена шире 0600 — запроса нет" test -e "$FAKE/curl.argv"
+token_file https://other.example.org/robot-api/v1/labels
+err="$(tp pull 2>&1)"; rc=$?
+check "pull: адрес ручки не тот, для которого токен — отказ" test "$rc" -ne 0
+check_not "pull: адрес не тот — токен не отправлен" test -e "$FAKE/curl.argv"
+check_not "pull: адрес не тот — токена нет в журнале" grep -qF "$TOKEN" <<< "$err"
+msg="$(tp set "TELEPORT_LABELS_URL=$URL" 2>&1)"; rc=$?
+check "TELEPORT_LABELS_URL через set — отказ (ro)" test "$rc" -ne 0
+check "TELEPORT_LABELS_URL через set — текст про labels-enable" grep -q 'labels-enable' <<< "$msg"
 check_not "TELEPORT_LABELS_URL через set: чужой путь — отказ" \
     tp set TELEPORT_LABELS_URL=https://stvor.example.org/x 2>/dev/null
+
+# ===========================================================================
+echo "== R3: перезапуск после записи подтверждается =="
+# MAJOR-1: a restart that failed while the old agent kept running.
+robot; token_file; labels_url "$URL"
+portal 200 prod sp-bbbbbbbb "$REV_B"; tp pull 2>/dev/null
+eq "R3: исходно применено" "$REV_B" "$(cat "$STATE/labels-applied")"
+touch "$FAKE/restart-fails-active"; reset_logs
+portal 200 prod sp-cccccccc "$REV_C"
+tp pull 2>/dev/null; rc=$?
+eq "R3: restart упал, агент активен — код 1" 1 "$rc"
+check "R3: restart упал — маркер остался" test -e "$STATE/labels-restart-pending"
+eq "R3: restart упал — ревизия не отмечена" "$REV_B" "$(cat "$STATE/labels-applied")"
+eq "R3: restart упал — конфиг уже новый" site=lab,space=sp-cccccccc "$(get TELEPORT_LABELS)"
+reset_logs; portal 304
+tp pull 2>/dev/null; rc=$?
+eq "R3: снова упал — код 1" 1 "$rc"
+check_not "R3: пока маркер есть — X-Applied-Revision не шлётся" grep -q '^X-Applied-Revision' "$FAKE/curl.req"
+eq "R3: пока маркер есть — ревизия не отмечена" "$REV_B" "$(cat "$STATE/labels-applied")"
+rm -f "$FAKE/restart-fails-active"; reset_logs; portal 304
+check "R3: следующий тик — код 0" tp pull 2>/dev/null
+eq "R3: следующий тик — перезапуск выполнен, хотя агент был активен" "restart teleport.service" "$(syslog)"
+check_not "R3: после перезапуска маркера нет" test -e "$STATE/labels-restart-pending"
+eq "R3: ревизия отмечена только после перезапуска" "$REV_C" "$(cat "$STATE/labels-applied")"
+reset_logs; portal 304; tp pull 2>/dev/null
+check "R3: теперь X-Applied-Revision" grep -qx "X-Applied-Revision: $REV_C" "$FAKE/curl.req"
+
+# restart answered 0, but no new invocation: not confirmed.
+robot
+touch "$FAKE/restart-noop"
+tp set-managed space=sp-bbbbbbbb 2>/dev/null; rc=$?
+eq "R3: restart без нового InvocationID — код 1" 1 "$rc"
+check "R3: restart без нового InvocationID — маркер остался" test -e "$ROOT/var/lib/bisquite/teleport/labels-restart-pending"
+
+# The tick died between the write and the restart: config and expected are
+# new, the marker is there, the agent is active with the old teleport.yaml.
+robot; token_file; labels_url "$URL"
+portal 200 prod sp-bbbbbbbb "$REV_B"; tp pull 2>/dev/null
+printf 'revision=%s\nenv=prod\nspace=sp-cccccccc\n' "$REV_C" > "$STATE/labels-expected"
+echo pending > "$STATE/labels-restart-pending"
+lib conf_set teleport TELEPORT_LABELS=site=lab,space=sp-cccccccc
+reset_logs; portal 304
+check_not "R3: убитый тик — перед перезапуском X-Applied-Revision не шлётся" \
+    bash -c 'bash "$1" pull 2>/dev/null; grep -q "^X-Applied-Revision" "$2"' _ "$STAGED/bisquite-teleport" "$FAKE/curl.req"
+eq "R3: убитый тик — перезапуск на следующем тике" "restart teleport.service" "$(syslog)"
+eq "R3: убитый тик — teleport.yaml с новым space" 3 "$(yaml_spaces sp-cccccccc)"
+eq "R3: убитый тик — ревизия отмечена после перезапуска" "$REV_C" "$(cat "$STATE/labels-applied")"
+check_not "R3: убитый тик — маркера нет" test -e "$STATE/labels-restart-pending"
+
+# ===========================================================================
+echo "== leave снимает метки =="
+robot; portal 200 prod sp-bbbbbbbb "$REV_B"; enable_labels
+echo pending > "$ROOT/var/lib/bisquite/teleport/labels-restart-pending"
+reset_logs
+check "leave — код 0" tp leave 2>/dev/null
+check "leave: таймер выключен" grep -qx "disable --now bisquite-teleport-labels.timer" "$FAKE/systemctl.log"
+for f in etc/bisquite/teleport/labels-token var/lib/bisquite/teleport/labels-expected \
+         var/lib/bisquite/teleport/labels-applied var/lib/bisquite/teleport/labels-restart-pending; do
+    check_not "leave: $f удалён" test -e "$ROOT/$f"
+done
+eq "leave: TELEPORT_LABELS_URL очищен" "" "$(get TELEPORT_LABELS_URL)"
 
 # ===========================================================================
 echo "== join: набор ключей не изменился (R2) =="
@@ -382,6 +467,11 @@ check "join со старым набором ключей" env BISQUITE_TELEPORT
 eq "join: метки записаны" site=lab,space=sp-aaaaaaaa "$(get TELEPORT_LABELS)"
 check "join: teleport.yaml собран" grep -q '"space": "sp-aaaaaaaa"' "$ROOT/etc/teleport.yaml"
 check_not "join: таймер меток не трогает" grep -qs labels "$FAKE/systemctl.log"
+msg="$(env BISQUITE_TELEPORT_SYSTEMD=0 TELEPORT_BIN="$ROOT/usr/local/bin/teleport" bash "$STAGED/bisquite-teleport" join \
+    TELEPORT_PROXY=teleport.example.org TELEPORT_TOKEN=abcdefgh1 "TELEPORT_LABELS_URL=$URL" 2>&1)"; rc=$?
+check "join с TELEPORT_LABELS_URL — отказ" test "$rc" -ne 0
+check "join с TELEPORT_LABELS_URL — текст про labels-enable" grep -q 'labels-enable' <<< "$msg"
+eq "join с TELEPORT_LABELS_URL — адрес не записан" "" "$(get TELEPORT_LABELS_URL)"
 
 # ===========================================================================
 echo "== install.sh: юниты меток в сборке =="
@@ -402,6 +492,7 @@ svc="$EXT/bisquite-teleport-labels.service"; tmr="$EXT/bisquite-teleport-labels.
 check "юнит: oneshot" grep -qx 'Type=oneshot' "$svc"
 check "юнит: только при токене" grep -qx 'ConditionPathExists=/etc/bisquite/teleport/labels-token' "$svc"
 check "юнит: ExecStart — pull" grep -qx 'ExecStart=/usr/local/sbin/bisquite-teleport pull' "$svc"
+check "юнит: TimeoutStartSec=5min" grep -qx 'TimeoutStartSec=5min' "$svc"
 check "таймер: OnBootSec=1min" grep -qx 'OnBootSec=1min' "$tmr"
 check "таймер: OnUnitActiveSec=1min" grep -qx 'OnUnitActiveSec=1min' "$tmr"
 check "таймер: RandomizedDelaySec=20s" grep -qx 'RandomizedDelaySec=20s' "$tmr"
@@ -437,8 +528,9 @@ EOF
 # A robot running an earlier build: agent 18.6.8 (older than the default of
 # install.sh — a wrong version would make install.sh download), joined, with
 # a config of its own.
+AGENT_V=18.6.8
 old_robot(){ # old_robot <extension root: /opt/bisquite or /opt/vmsetup>
-    new_root; fake_teleport 18.6.8
+    new_root; fake_teleport "$AGENT_V"
     local dir="$ROOT$1/teleport-agent"
     mkdir -p "$dir" "$ROOT/usr/local/sbin" "$ROOT/var/lib/teleport" "$ROOT/etc/bisquite/teleport"
     printf 'name: teleport-agent\nversion: 2.4.0\n' > "$dir/extension.yaml"
@@ -476,10 +568,10 @@ updated_ok(){ # updated_ok <label>
         check "$1: $u установлен" cmp -s "$t/$u" "$ROOT/etc/systemd/system/$u"
     done
     check "$1: daemon-reload" grep -qx 'daemon-reload' "$FAKE/systemctl.log"
-    check "$1: таймер включён" grep -qx 'enable --now bisquite-teleport-labels.timer' "$FAKE/systemctl.log"
+    check_not "$1: без токена меток таймер не включается" grep -q 'enable' "$FAKE/systemctl.log"
     check_not "$1: агент не перезапускался" grep -q 'teleport.service' "$FAKE/systemctl.log"
     check_not "$1: бинарь агента не скачивался" test -e "$FAKE/curl.argv"
-    check "$1: бинарь агента прежний" grep -q 'v18.6.8' "$ROOT/usr/local/bin/teleport"
+    check "$1: бинарь агента прежний" grep -q "v$AGENT_V" "$ROOT/usr/local/bin/teleport"
     eq "$1: config сохранён — env" dev "$(get TELEPORT_ENV)"
     eq "$1: config сохранён — прокси" teleport.example.org "$(get TELEPORT_PROXY)"
     check "$1: регистрация цела" test -s "$ROOT/var/lib/teleport/host_uuid"
@@ -498,7 +590,7 @@ elif make_archive; then
     out="$(bash "$UPD" 2>&1)"; rc=$?
     [[ "$rc" -eq 0 ]] || echo "$out" >&3
     updated_ok "раскладка /opt/bisquite"
-    check "раскладка /opt/bisquite: версия агента передана install.sh" grep -q '18.6.8 уже установлен' <<< "$out"
+    check "раскладка /opt/bisquite: агент не тронут install.sh" grep -q 'агент Teleport v18.6.8 git: go1.25 не трогаю' <<< "$out"
     reset_logs
     out="$(bash "$UPD" 2>&1)"; rc=$?
     eq "повторный update.sh — код 0" 0 "$rc"
@@ -512,6 +604,40 @@ elif make_archive; then
     updated_ok "раскладка /opt/vmsetup"
     check "раскладка /opt/vmsetup: старый каталог не тронут" test -f "$ROOT/opt/vmsetup/teleport-agent/obsolete-file"
     check "раскладка /opt/vmsetup: сказано про старый путь" grep -q '/opt/vmsetup' <<< "$out"
+
+    # K1: a fork with a version suffix is never replaced.
+    AGENT_V=18.10.0-oidc old_robot /opt/bisquite
+    AGENT_V=18.10.0-oidc; out="$(bash "$UPD" 2>&1)"; rc=$?
+    [[ "$rc" -eq 0 ]] || echo "$out" >&3
+    updated_ok "форк v18.10.0-oidc"
+    AGENT_V=18.6.8
+
+    # With a labels token the timer is enabled right away.
+    old_robot /opt/bisquite
+    printf 'url=%s\ntoken=%s\n' "$URL" "$TOKEN" > "$ROOT/etc/bisquite/teleport/labels-token"
+    chmod 0600 "$ROOT/etc/bisquite/teleport/labels-token"
+    bash "$UPD" >/dev/null 2>&1
+    check "с токеном меток — таймер включён" grep -qx 'enable --now bisquite-teleport-labels.timer' "$FAKE/systemctl.log"
+
+    # install.sh fails (armhf): the previous directory comes back.
+    for layout in /opt/bisquite /opt/vmsetup; do
+        old_robot "$layout"
+        printf '#!/bin/sh\necho armhf\n' > "$ROOT/bin/dpkg"
+        link_before="$(readlink "$ROOT/usr/local/sbin/bisquite-teleport")"
+        bash "$UPD" >/dev/null 2>&1; rc=$?
+        check "$layout: install.sh упал — update.sh ≠ 0" test "$rc" -ne 0
+        if [[ "$layout" == /opt/bisquite ]]; then
+            check "$layout: install.sh упал — прежний каталог возвращён" \
+                grep -qx 'version: 2.4.0' "$ROOT/opt/bisquite/teleport-agent/extension.yaml"
+            check "$layout: install.sh упал — прежние файлы на месте" test -f "$ROOT/opt/bisquite/teleport-agent/obsolete-file"
+        else
+            check_not "$layout: install.sh упал — нового каталога нет" test -e "$ROOT/opt/bisquite/teleport-agent"
+            check "$layout: install.sh упал — старый каталог цел" test -f "$ROOT/opt/vmsetup/teleport-agent/obsolete-file"
+        fi
+        eq "$layout: install.sh упал — CLI смотрит туда же" "$link_before" "$(readlink "$ROOT/usr/local/sbin/bisquite-teleport")"
+        check_not "$layout: install.sh упал — временных каталогов нет" \
+            bash -c 'find "$1/opt/bisquite" -maxdepth 1 -name ".teleport-agent.*" | grep -q .' _ "$ROOT"
+    done
 
     old_robot /opt/bisquite
     rm -f "$ROOT/usr/local/bin/teleport"

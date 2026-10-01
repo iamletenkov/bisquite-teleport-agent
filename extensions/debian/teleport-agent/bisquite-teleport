@@ -121,6 +121,11 @@ RE_REVISION='^[0-9a-f]{16}$'
 LABELS_TOKEN="$ROOT/etc/bisquite/teleport/labels-token"
 LABELS_EXPECTED="$STATE/labels-expected"
 LABELS_APPLIED="$STATE/labels-applied"
+# Written before the knobs change, removed only after a confirmed restart: a
+# tick that died in between, or a restart that failed while the old agent
+# kept running, is finished by the next tick (R3).
+LABELS_PENDING="$STATE/labels-restart-pending"
+LABELS_LOCKED=0
 LABELS_TIMER=bisquite-teleport-labels.timer
 RESTART_TIMEOUT="${BISQUITE_TELEPORT_RESTART_TIMEOUT:-30}"
 
@@ -770,15 +775,43 @@ labels_with_space(){
 # Restart, not reload: on HUP Teleport keeps the open SSH sessions of people
 # of the old space while the apps already answer by the new labels. One
 # restart moves the node and every app together (the sessions break, the
-# robot is away for a few seconds). Then wait for the agent to be active.
+# robot is away for a few seconds). Success is a restart systemd accepted
+# AND a new invocation of the unit that is active — an agent that stayed
+# active through a failed restart still runs the old teleport.yaml.
+invocation(){ systemctl show -p InvocationID --value teleport.service 2>/dev/null || true; }
 restart_agent(){
-    local waited=0
-    systemctl restart teleport.service >/dev/null 2>&1 || true
+    local waited=0 before now
+    before="$(invocation)"
+    systemctl restart teleport.service >/dev/null 2>&1 || return 1
     while :; do
-        systemctl is-active --quiet teleport.service && return 0
+        now="$(invocation)"
+        if [[ -n "$now" && "$now" != "$before" ]] && systemctl is-active --quiet teleport.service; then
+            return 0
+        fi
         (( waited < RESTART_TIMEOUT )) || return 1
         sleep 1; waited=$((waited + 1))
     done
+}
+# Restart and, only on success, drop the pending marker.
+restart_for_labels(){
+    if ! restart_agent; then
+        log "ОШИБКА: агент не поднялся с новыми метками за ${RESTART_TIMEOUT} с (перезапуск не подтверждён) — повтор на следующем тике; journalctl -u teleport"
+        return 1
+    fi
+    rm -f -- "$LABELS_PENDING"
+    log "агент перезапущен: узел и приложения — с новыми метками"
+}
+
+# One labels operation at a time (pull, labels-enable, set-managed): the
+# timer and a person may meet. labels_lock wait|nowait.
+labels_lock(){
+    (( LABELS_LOCKED )) && return 0
+    install -d -m 0700 "$STATE" || die "не создать $STATE"
+    if command -v flock >/dev/null 2>&1; then
+        exec 9> "$STATE/.labels.lock"
+        if [[ "$1" == wait ]]; then flock -w 120 9 || return 1; else flock -n 9 || return 1; fi
+    fi
+    LABELS_LOCKED=1
 }
 
 # Is the agent running with what the config says? Without systemd (a build,
@@ -805,22 +838,24 @@ apply_managed(){
         log "метки env и space уже такие — без изменений"
         return 0
     fi
+    local restart=0
+    if has_systemd && [[ -n "${C[TELEPORT_PROXY]}" ]]; then
+        restart=1
+        # Before the write: whatever happens after it, the restart is owed.
+        write_state "$LABELS_PENDING" pending || die "не записан $LABELS_PENDING"
+    fi
     save_conf "${pairs[@]}"
     for pair in "${pairs[@]}"; do C[${pair%%=*}]="${pair#*=}"; done
     log "записано: ${pairs[*]}"
-    if ! has_systemd; then
-        log "systemd не запущен — применится при старте агента"
+    if (( ! restart )); then
+        if has_systemd; then
+            log "кластер не задан — применится после bisquite-teleport join"
+        else
+            log "systemd не запущен — применится при старте агента"
+        fi
         return 0
     fi
-    if [[ -z "${C[TELEPORT_PROXY]}" ]]; then
-        log "кластер не задан — применится после bisquite-teleport join"
-        return 0
-    fi
-    if ! restart_agent; then
-        log "ОШИБКА: агент не поднялся за ${RESTART_TIMEOUT} с после перезапуска — journalctl -u teleport"
-        return 1
-    fi
-    log "агент перезапущен: узел и приложения — с новыми метками"
+    restart_for_labels
 }
 
 cmd_set_managed(){
@@ -841,6 +876,7 @@ cmd_set_managed(){
             || die "set-managed: $key — ожидали 1–63 знака [a-z0-9-], первый — буква или цифра"
         if [[ "$key" == env ]]; then env="$val"; else space="$val"; fi
     done
+    labels_lock wait || die "метки сейчас применяет другой процесс — повторите"
     apply_managed "$env" "$space"
 }
 
@@ -894,6 +930,32 @@ parse_labels(){
     [[ "$P_ENV" =~ $RE_MANAGED_VALUE && "$P_SPACE" =~ $RE_MANAGED_VALUE && "$P_REV" =~ $RE_REVISION ]]
 }
 
+# The token file: `url=<адрес>` and `token=<токен>`, 0600, root. The address
+# is kept next to the token: the token goes to that host and no other, even if
+# TELEPORT_LABELS_URL is changed by hand. read_token_file sets T_URL, T_TOKEN;
+# the reason of a refusal goes to the log, never the content.
+read_token_file(){
+    local line mode owner
+    T_URL=""; T_TOKEN=""
+    mode="$(stat -c %a "$LABELS_TOKEN")" || return 1
+    owner="$(stat -c %u "$LABELS_TOKEN")" || return 1
+    if (( (8#$mode & 8#077) != 0 )); then
+        log "ОШИБКА: $LABELS_TOKEN — права $mode, шире 0600; выполните labels-enable заново"; return 1
+    fi
+    if [[ -z "$ROOT" && "$owner" != 0 ]]; then
+        log "ОШИБКА: $LABELS_TOKEN — владелец не root; выполните labels-enable заново"; return 1
+    fi
+    while IFS= read -r line; do
+        case "$line" in
+            url=*) T_URL="${line#url=}" ;;
+            token=*) T_TOKEN="${line#token=}" ;;
+        esac
+    done < "$LABELS_TOKEN"
+    if [[ ! "$T_URL" =~ $RE_LABELS_URL || ! "$T_TOKEN" =~ $RE_LABELS_TOKEN ]]; then
+        log "ОШИБКА: $LABELS_TOKEN испорчен — выпустите токен меток на портале и выполните labels-enable"; return 1
+    fi
+}
+
 # One tick of the timer. Network and HTTP errors: one journal line, code 0 —
 # the next tick is the retry. A refused answer or an agent that did not come
 # up: code 1. The token travels only in a header file curl reads (-H @file):
@@ -911,21 +973,19 @@ cmd_pull(){
         log "метки с портала выключены: нет $LABELS_TOKEN — bisquite-teleport labels-enable"
         return 0
     fi
-    token="$(< "$LABELS_TOKEN")"
-    [[ "$token" =~ $RE_LABELS_TOKEN ]] \
-        || die "$LABELS_TOKEN испорчен — выпустите токен меток на портале и выполните bisquite-teleport labels-enable"
-    install -d -m 0700 "$STATE" || die "не создать $STATE"
-    # One tick at a time: the timer and labels-enable may meet.
-    if command -v flock >/dev/null 2>&1; then
-        exec 9> "$STATE/.labels.lock"
-        flock -n 9 || { log "метки уже запрашиваются — пропускаю тик"; return 0; }
+    read_token_file || return 1
+    if [[ "$T_URL" != "$url" ]]; then
+        log "ОШИБКА: TELEPORT_LABELS_URL ($url) не тот адрес, для которого выпущен токен ($T_URL) — токен не отправлен; labels-enable URL=… заново"
+        return 1
     fi
+    token="$T_TOKEN"
+    labels_lock nowait || { log "метки уже применяются — пропускаю тик"; return 0; }
 
     if read_expected; then
         have_exp=1
         # R3: report only what is really in effect — the knobs carry the
-        # expected labels and the agent runs with them.
-        if [[ "$(applied_revision)" == "$EXP_REV" ]] && labels_match && agent_running; then
+        # expected labels, no restart is owed and the agent runs with them.
+        if [[ "$(applied_revision)" == "$EXP_REV" && ! -e "$LABELS_PENDING" ]] && labels_match && agent_running; then
             report=1
         fi
     fi
@@ -976,17 +1036,22 @@ cmd_pull(){
     if ! labels_match; then
         log "метки расходятся с порталом (env=$EXP_ENV, space=$EXP_SPACE) — применяю"
         apply_managed "$EXP_ENV" "$EXP_SPACE" || return 1
-    elif [[ "$(applied_revision)" != "$EXP_REV" ]] && has_systemd && [[ -n "${C[TELEPORT_PROXY]}" ]] \
-         && ! systemctl is-active --quiet teleport.service; then
-        # Written on an earlier tick, but the agent did not come up then.
-        log "агент не активен — перезапускаю с метками портала"
-        if ! restart_agent; then
-            log "ОШИБКА: агент не поднялся за ${RESTART_TIMEOUT} с после перезапуска — journalctl -u teleport"
-            return 1
+    elif has_systemd && [[ -n "${C[TELEPORT_PROXY]}" ]]; then
+        if [[ -e "$LABELS_PENDING" ]]; then
+            # Written earlier, restart not confirmed (it failed, or the tick
+            # died between the write and the restart): restart whether or not
+            # the agent looks active — it may run the old teleport.yaml.
+            log "перезапуск после записи меток не подтверждён — перезапускаю"
+            restart_for_labels || return 1
+        elif [[ "$(applied_revision)" != "$EXP_REV" ]] && ! systemctl is-active --quiet teleport.service; then
+            log "агент не активен — перезапускаю с метками портала"
+            restart_for_labels || return 1
         fi
     fi
     if [[ "$(applied_revision)" != "$EXP_REV" ]]; then
-        if agent_running; then
+        if [[ -e "$LABELS_PENDING" ]]; then
+            log "метки записаны, перезапуск агента не подтверждён — ревизия не отмечена применённой"
+        elif agent_running; then
             write_state "$LABELS_APPLIED" "$EXP_REV" || die "не записано $LABELS_APPLIED"
             log "метки портала действуют (env=$EXP_ENV, space=$EXP_SPACE, ревизия $EXP_REV) — портал узнает на следующем тике"
         else
@@ -1013,13 +1078,14 @@ cmd_labels_enable(){
     token="${token#"${token%%[![:space:]]*}"}"; token="${token%"${token##*[![:space:]]}"}"
     [[ "$token" =~ $RE_LABELS_TOKEN ]] \
         || die "labels-enable: токен со stdin не прочитан или не по форме (43 знака [A-Za-z0-9_-])"
+    labels_lock wait || die "метки сейчас применяет другой процесс — повторите"
     load_conf
     old_url="${C[TELEPORT_LABELS_URL]}"
     dir="$(dirname "$LABELS_TOKEN")"
     install -d -m 0755 "$dir" || die "не создать $dir"
     # mktemp creates the file 0600: the token is never readable by others.
     tmp="$(mktemp "$dir/.labels-token.XXXXXX")" || die "не создать файл в $dir"
-    printf '%s\n' "$token" > "$tmp" || { rm -f -- "$tmp"; die "токен меток не записан"; }
+    printf 'url=%s\ntoken=%s\n' "$url" "$token" > "$tmp" || { rm -f -- "$tmp"; die "токен меток не записан"; }
     if ! { chmod 0600 "$tmp" && mv -f -- "$tmp" "$LABELS_TOKEN"; }; then
         rm -f -- "$tmp"; die "токен меток не записан"
     fi
@@ -1043,7 +1109,12 @@ cmd_leave(){
     rm -f "$YAML"
     rm -r -f -- "$ROLLBACK"
     rm -f -- "$REG_SECRET"
-    save_conf TELEPORT_PROXY= TELEPORT_TOKEN= TELEPORT_CA_PIN= TELEPORT_JOIN_METHOD=token
+    # Labels from the portal belong to this registration too.
+    if has_systemd; then
+        systemctl disable --now "$LABELS_TIMER" >/dev/null 2>&1 || true
+    fi
+    rm -f -- "$LABELS_TOKEN" "$LABELS_EXPECTED" "$LABELS_APPLIED" "$LABELS_PENDING"
+    save_conf TELEPORT_PROXY= TELEPORT_TOKEN= TELEPORT_CA_PIN= TELEPORT_JOIN_METHOD=token TELEPORT_LABELS_URL=
     log "отключено: агент выключен, состояние стёрто. Запись ноды в кластере исчезнет по истечении heartbeat или удаляется в админке."
 }
 
@@ -1081,6 +1152,7 @@ cmd_status(){
     if read_expected; then
         local applied="не применены"
         [[ "$(applied_revision)" == "$EXP_REV" ]] && applied="действуют"
+        [[ -e "$LABELS_PENDING" ]] && applied="ждут перезапуска агента"
         echo "  ожидаемые: env=$EXP_ENV space=$EXP_SPACE (ревизия $EXP_REV), $applied"
     fi
     if [[ -n "${C[TELEPORT_PROXY]}" ]]; then
@@ -1106,7 +1178,14 @@ cmd_status(){
 }
 
 case "${1:-}" in
-    join) shift; cmd_join "$@" ;;
+    join)
+        shift
+        # R2: join keeps its keys; the labels address is labels-enable's.
+        for a in "$@"; do
+            [[ "$a" == TELEPORT_LABELS_URL=* ]] \
+                && die "TELEPORT_LABELS_URL в join не задаётся — после join: printf '%s' <токен> | bisquite-teleport labels-enable URL=…"
+        done
+        cmd_join "$@" ;;
     set) shift; cmd_set "$@" ;;
     leave) cmd_leave ;;
     status) cmd_status ;;
