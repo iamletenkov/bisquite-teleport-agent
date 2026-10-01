@@ -125,6 +125,13 @@ LABELS_APPLIED="$STATE/labels-applied"
 # tick that died in between, or a restart that failed while the old agent
 # kept running, is finished by the next tick (R3).
 LABELS_PENDING="$STATE/labels-restart-pending"
+# Unconfirmed restarts in a row: `count=N` and `last=<epoch>`. After
+# RESTART_TRIES of them, while the agent is active, the timer retries at most
+# once per RESTART_PAUSE seconds — an unconfirmable restart must not break the
+# SSH sessions of a healthy robot every minute.
+LABELS_ATTEMPTS="$STATE/labels-restart-attempts"
+RESTART_TRIES=3
+RESTART_PAUSE=900
 LABELS_LOCKED=0
 LABELS_TIMER=bisquite-teleport-labels.timer
 RESTART_TIMEOUT="${BISQUITE_TELEPORT_RESTART_TIMEOUT:-30}"
@@ -776,29 +783,78 @@ labels_with_space(){
 # of the old space while the apps already answer by the new labels. One
 # restart moves the node and every app together (the sessions break, the
 # robot is away for a few seconds). Success is a restart systemd accepted
-# AND a new invocation of the unit that is active — an agent that stayed
-# active through a failed restart still runs the old teleport.yaml.
-invocation(){ systemctl show -p InvocationID --value teleport.service 2>/dev/null || true; }
+# AND a new run of the unit that is active — an agent that stayed active
+# through a failed restart still runs the old teleport.yaml. A new run is a
+# changed InvocationID, MainPID or ActiveEnterTimestampMonotonic (whichever
+# this systemd reports; an empty or zero value is no evidence).
+unit_prop(){ systemctl show -p "$1" --value teleport.service 2>/dev/null || true; }
+unit_run(){
+    local p v out=""
+    for p in InvocationID MainPID ActiveEnterTimestampMonotonic; do
+        v="$(unit_prop "$p")"
+        [[ "$v" == 0 ]] && v=""
+        out+="$v|"
+    done
+    printf '%s' "$out"
+}
+new_run(){ # new_run <before> <now> — some field present now and changed
+    local -a b n
+    local i
+    IFS='|' read -r -a b <<< "$1"
+    IFS='|' read -r -a n <<< "$2"
+    for i in 0 1 2; do
+        [[ -n "${n[i]:-}" && "${n[i]:-}" != "${b[i]:-}" ]] && return 0
+    done
+    return 1
+}
 restart_agent(){
     local waited=0 before now
-    before="$(invocation)"
+    before="$(unit_run)"
     systemctl restart teleport.service >/dev/null 2>&1 || return 1
     while :; do
-        now="$(invocation)"
-        if [[ -n "$now" && "$now" != "$before" ]] && systemctl is-active --quiet teleport.service; then
+        now="$(unit_run)"
+        if new_run "$before" "$now" && systemctl is-active --quiet teleport.service; then
             return 0
         fi
         (( waited < RESTART_TIMEOUT )) || return 1
         sleep 1; waited=$((waited + 1))
     done
 }
-# Restart and, only on success, drop the pending marker.
+now_epoch(){ printf '%s' "${BISQUITE_TELEPORT_NOW:-$(date +%s)}"; }
+read_attempts(){
+    local line
+    ATT_COUNT=0; ATT_LAST=0
+    [[ -f "$LABELS_ATTEMPTS" ]] || return 0
+    while IFS= read -r line; do
+        case "$line" in
+            count=*) [[ "${line#count=}" =~ ^[0-9]{1,6}$ ]] && ATT_COUNT="${line#count=}" ;;
+            last=*) [[ "${line#last=}" =~ ^[0-9]{1,12}$ ]] && ATT_LAST="${line#last=}" ;;
+        esac
+    done < "$LABELS_ATTEMPTS"
+}
+# restart_for_labels tick|manual — restart and, only on confirmation, drop the
+# pending marker and the attempts counter. A tick pauses after RESTART_TRIES
+# unconfirmed attempts while the agent is active; a person (set-managed) is
+# never paused. Every attempt and every skip is its own journal line.
 restart_for_labels(){
+    local now next
+    now="$(now_epoch)"
+    read_attempts
+    if [[ "${1:-tick}" == tick ]] && (( ATT_COUNT >= RESTART_TRIES )) \
+       && systemctl is-active --quiet teleport.service; then
+        next=$((ATT_LAST + RESTART_PAUSE))
+        if (( now < next )); then
+            log "перезапуск пропущен: $ATT_COUNT неподтверждённых подряд, агент активен — следующая попытка через $((next - now)) с"
+            return 1
+        fi
+    fi
+    log "перезапуск агента с новыми метками (попытка $((ATT_COUNT + 1)))"
     if ! restart_agent; then
-        log "ОШИБКА: агент не поднялся с новыми метками за ${RESTART_TIMEOUT} с (перезапуск не подтверждён) — повтор на следующем тике; journalctl -u teleport"
+        write_state "$LABELS_ATTEMPTS" "count=$((ATT_COUNT + 1))"$'\n'"last=$now" || true
+        log "ОШИБКА: агент не поднялся с новыми метками за ${RESTART_TIMEOUT} с (перезапуск не подтверждён, попытка $((ATT_COUNT + 1))) — journalctl -u teleport"
         return 1
     fi
-    rm -f -- "$LABELS_PENDING"
+    rm -f -- "$LABELS_PENDING" "$LABELS_ATTEMPTS"
     log "агент перезапущен: узел и приложения — с новыми метками"
 }
 
@@ -822,7 +878,7 @@ agent_running(){
     systemctl is-active --quiet teleport.service
 }
 
-# apply_managed <env|""> <space|""> — write through the library without the
+# apply_managed <env|""> <space|""> [tick|manual] — write through the library without the
 # apply hook (its reload is the HUP above), then one restart. 0 — applied or
 # nothing to change, 1 — the agent did not come up.
 apply_managed(){
@@ -855,7 +911,7 @@ apply_managed(){
         fi
         return 0
     fi
-    restart_for_labels
+    restart_for_labels "${3:-tick}"
 }
 
 cmd_set_managed(){
@@ -877,7 +933,7 @@ cmd_set_managed(){
         if [[ "$key" == env ]]; then env="$val"; else space="$val"; fi
     done
     labels_lock wait || die "метки сейчас применяет другой процесс — повторите"
-    apply_managed "$env" "$space"
+    apply_managed "$env" "$space" manual
 }
 
 # Local state of the last portal answer. Read back with the same checks as
@@ -1042,10 +1098,10 @@ cmd_pull(){
             # died between the write and the restart): restart whether or not
             # the agent looks active — it may run the old teleport.yaml.
             log "перезапуск после записи меток не подтверждён — перезапускаю"
-            restart_for_labels || return 1
+            restart_for_labels tick || return 1
         elif [[ "$(applied_revision)" != "$EXP_REV" ]] && ! systemctl is-active --quiet teleport.service; then
             log "агент не активен — перезапускаю с метками портала"
-            restart_for_labels || return 1
+            restart_for_labels tick || return 1
         fi
     fi
     if [[ "$(applied_revision)" != "$EXP_REV" ]]; then
@@ -1113,7 +1169,7 @@ cmd_leave(){
     if has_systemd; then
         systemctl disable --now "$LABELS_TIMER" >/dev/null 2>&1 || true
     fi
-    rm -f -- "$LABELS_TOKEN" "$LABELS_EXPECTED" "$LABELS_APPLIED" "$LABELS_PENDING"
+    rm -f -- "$LABELS_TOKEN" "$LABELS_EXPECTED" "$LABELS_APPLIED" "$LABELS_PENDING" "$LABELS_ATTEMPTS"
     save_conf TELEPORT_PROXY= TELEPORT_TOKEN= TELEPORT_CA_PIN= TELEPORT_JOIN_METHOD=token TELEPORT_LABELS_URL=
     log "отключено: агент выключен, состояние стёрто. Запись ноды в кластере исчезнет по истечении heartbeat или удаляется в админке."
 }

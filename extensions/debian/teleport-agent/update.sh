@@ -88,7 +88,46 @@ log "teleport-agent: было ${previous:-?}, ставлю ${version:-?}; аге
 digest="$(lib_digest "$SRC/lib")"
 [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "отпечаток lib/ не посчитан"
 LIB_DIR="$GUEST/lib/$digest"
-NEW=""; OLD=""; LIB_NEW=""; SWAPPED=0; DONE=0
+NEW=""; OLD=""; LIB_NEW=""; SWAPPED=0; DONE=0; UNITS_BAK=""
+# What install.sh rewires: the CLI and library links, the schema and hook
+# links, the units (copies). Remembered before the swap, put back on failure:
+# a half-run install.sh must not leave the CLI pointing into a removed
+# directory — ExecStartPre of the agent runs it.
+LINKS=("$ROOT/usr/local/sbin/bisquite-teleport" "$ROOT/usr/local/sbin/bisquite-conf"
+       "$GUEST/knobs/teleport" "$GUEST/knobs/teleport.apply" "$GUEST/knobs/teleport.secret")
+UNITS=(teleport.service bisquite-teleport-apps.path bisquite-teleport-apps.service
+       bisquite-teleport-token.path bisquite-teleport-token.service
+       bisquite-teleport-labels.service bisquite-teleport-labels.timer)
+declare -A LINK_BEFORE=()
+snapshot(){
+    local l u
+    for l in "${LINKS[@]}"; do
+        if [[ -L "$l" ]]; then LINK_BEFORE[$l]="$(readlink "$l")"; else LINK_BEFORE[$l]=""; fi
+    done
+    UNITS_BAK="$(mktemp -d "$GUEST/.$NAME.units.XXXXXX")"
+    for u in "${UNITS[@]}"; do
+        [[ -f "$ROOT/etc/systemd/system/$u" ]] && cp -a -- "$ROOT/etc/systemd/system/$u" "$UNITS_BAK/$u"
+    done
+    return 0
+}
+restore_wiring(){
+    local l u
+    for l in "${LINKS[@]}"; do
+        if [[ -n "${LINK_BEFORE[$l]}" ]]; then
+            ln -sfn -- "${LINK_BEFORE[$l]}" "$l"
+        elif [[ -L "$l" ]]; then
+            rm -f -- "$l"
+        fi
+    done
+    for u in "${UNITS[@]}"; do
+        if [[ -f "$UNITS_BAK/$u" ]]; then
+            cp -a -- "$UNITS_BAK/$u" "$ROOT/etc/systemd/system/$u"
+        else
+            rm -f -- "$ROOT/etc/systemd/system/$u"
+        fi
+    done
+    log "ссылки CLI и схемы и юниты возвращены к прежним"
+}
 # On any failure after the swap the previous directory comes back: a robot
 # is never left with half an update. Without a previous one (the /opt/vmsetup
 # layout) the new directory goes away again.
@@ -99,8 +138,9 @@ cleanup(){
             mv -T -- "$OLD" "$TARGET" && log "прежний каталог $TARGET возвращён"
         fi
         OLD=""
+        [[ -n "$UNITS_BAK" ]] && restore_wiring
     fi
-    rm -r -f -- ${NEW:+"$NEW"} ${OLD:+"$OLD"} ${LIB_NEW:+"$LIB_NEW"}
+    rm -r -f -- ${NEW:+"$NEW"} ${OLD:+"$OLD"} ${LIB_NEW:+"$LIB_NEW"} ${UNITS_BAK:+"$UNITS_BAK"}
 }
 trap cleanup EXIT
 install -d -m 0755 "$GUEST" "$GUEST/lib"
@@ -126,6 +166,7 @@ chmod -R go-w "$NEW"
 chmod 0755 "$NEW" "$NEW"/*.sh "$NEW/bisquite-teleport" "$NEW/knobs.apply"
 [[ -n "$ROOT" ]] || chown -R 0:0 "$NEW"
 ln -sfn -- "$LIB_DIR" "$NEW/lib"
+snapshot
 if [[ -e "$TARGET" || -L "$TARGET" ]]; then
     OLD="$GUEST/.$NAME.old.$$"
     rm -r -f -- "$OLD"
