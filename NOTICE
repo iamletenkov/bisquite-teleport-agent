@@ -1,0 +1,13 @@
+bisquite-teleport-agent Notice
+==============================
+
+Copyright (c) 2026 Letenkov Maksim
+
+bisquite-teleport-agent is distributed under the PolyForm Noncommercial License 1.0.0 with the required attribution notices found in `LICENSE`. Commercial use requires a separate license from Letenkov Maksim (letenkovmaksim@yandex.ru).
+
+`lib/bisquite-conf` is a copy of the settings library of bisquite-extensions (https://github.com/iamletenkov/bisquite-extensions), same author, same license.
+
+Third-Party Components
+----------------------
+
+The package bundles no third-party code. At run time it uses Teleport (https://goteleport.com), installed separately by the operator; its license applies to the Teleport binary.

@@ -1,0 +1,39 @@
+# Изменения
+
+Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии —
+[SemVer](https://semver.org/lang/ru/).
+
+## [3.0.0] — 2026-10-05
+
+Первый релиз отдельным проектом. Код — расширение `teleport-agent` 2.5.0
+репозитория bisquite-extensions, история перенесена.
+
+### Добавлено
+- Пакет `bisquite-teleport-agent_3.0.0_all.deb` (`tools/build-deb.sh`,
+  `make deb`): `/usr/lib/bisquite-teleport/`, `/usr/sbin/bisquite-teleport`,
+  юниты в `/usr/lib/systemd/system/`. Сборка воспроизводимая.
+- `postinst` переводит машину с расширения 2.x: копии юнитов из
+  `/etc/systemd/system` уходят в `/var/lib/bisquite/teleport/2.x-units/`,
+  ссылки включения — на юниты пакета, `/usr/local/sbin/bisquite-teleport` —
+  ссылка на `/usr/sbin/bisquite-teleport`. Конфиг, регистрация, токен меток и
+  работающий агент не трогаются.
+- `prerm`/`postrm`: удаление и `purge` регистрацию не стирают.
+- Команда `bisquite-teleport version`.
+- `docs/portal-labels-api.md` — контракт `GET /robot-api/v1/labels`.
+- LICENSE (PolyForm Noncommercial 1.0.0), NOTICE, SECURITY.md, CI: shellcheck,
+  тесты, сборка `.deb`.
+
+### Изменено
+- CLI вызывается как `/usr/sbin/bisquite-teleport` (юниты, команда метки
+  `os_logins` в `teleport.yaml`).
+- Бинарь Teleport пакет не ставит: его ставит обёртка bisquite-extensions
+  (`TELEPORT_VERSION/MIRROR/SHA256`), скрипт портала или оператор.
+
+### Удалено
+- `install.sh`, `update.sh` и `extension.yaml` расширения — они остались в
+  обёртке `teleport-agent` 3.x в bisquite-extensions.
+
+### Не изменилось
+- Пути `/etc/bisquite/teleport`, `/var/lib/bisquite/teleport`, имена юнитов,
+  метка `managed_by=bisquite-teleport-agent`, контракты `apps.d` и
+  `/robot-api/v1/labels`, ключи `join`.
