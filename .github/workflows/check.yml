@@ -1,0 +1,51 @@
+name: Check
+
+# shellcheck, тесты на подменённом корне и сборка .deb — та же точка входа
+# tools/check.sh, что запускают руками. Пакет собирается воспроизводимо:
+# сумма артефакта CI совпадает с суммой локальной сборки того же коммита.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # SOURCE_DATE_EPOCH — время последнего коммита
+
+      - name: Install tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends shellcheck lintian
+
+      - name: shellcheck and tests
+        run: tools/check.sh
+        env:
+          CI: "1"
+
+      - name: Build .deb
+        run: |
+          tools/build-deb.sh
+          dpkg-deb --info dist/*.deb
+          dpkg-deb --contents dist/*.deb
+
+      # Сведения, а не ворота: пакет собран dpkg-deb без debhelper.
+      - name: lintian (informational)
+        run: lintian --no-tag-display-limit dist/*.deb || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: dist/
