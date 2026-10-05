@@ -11,6 +11,7 @@
 #   bisquite-teleport set-managed env=… space=…   метки, которыми управляет портал
 #   bisquite-teleport pull              забрать метки с портала и применить (зовёт таймер)
 #   bisquite-teleport labels-enable URL=…   включить автоприменение (токен — со stdin)
+#   bisquite-teleport version           версия пакета агента
 #
 # Ручки — /etc/bisquite/teleport/config (0600), домен `teleport` библиотеки
 # bisquite-conf; типы и шаблоны значений — схема knobs рядом со скриптом.
@@ -21,7 +22,7 @@
 #   TELEPORT_TOKEN=                 token: join-токен (node[,app]), стирается после
 #                                   регистрации; bound_keypair: имя токена, остаётся
 #   TELEPORT_CA_PIN=sha256:…        необязательно: сверка CA кластера
-#   TELEPORT_ENV=                   метка env — по ней smart_role даёт доступ
+#   TELEPORT_ENV=                   метка env — по ней роли кластера дают доступ
 #   TELEPORT_NODENAME=              пусто — короткое имя хоста
 #   TELEPORT_LABELS=k=v,k=v         прочие метки ноды (env/app/managed_by нельзя)
 #   TELEPORT_APPS=имя=порт|URI,…    приложения оператора, любой адрес
@@ -59,8 +60,8 @@
 #   URI=https://127.0.0.1:9002      только петля
 #   ICON=mcpVscode                  имя иконки в веб-морде прокси
 #
-# ПРАВО ДОСТУПА ЗАДАЁТ ТОЛЬКО ОПЕРАТОР. Роль smart_role стека сверяет метку
-# env с tpEnv пользователя, app — с tpApps. Приложение получает метки ноды
+# ПРАВО ДОСТУПА ЗАДАЁТ ТОЛЬКО ОПЕРАТОР. Роли кластера сверяют метки узла
+# (env, app) с атрибутами пользователя. Приложение получает метки ноды
 # плюс app=<имя>; единственная метка, которую объявление задаёт само, —
 # teleport.icon, и решением о доступе она не является. Поэтому файл,
 # положенный расширением или кем-то ещё, не открывает приложение чужому env.
@@ -69,8 +70,8 @@ set -uo pipefail
 ROOT="${BISQUITE_TELEPORT_ROOT:-}"
 # The settings library sees the same scratch root as this script.
 export BISQUITE_CONF_ROOT="${BISQUITE_CONF_ROOT:-$ROOT}"
-# /usr/local/sbin/bisquite-teleport is a link into the extension directory;
-# resolving it finds lib/bisquite-conf of the same build.
+# /usr/sbin/bisquite-teleport is a link into /usr/lib/bisquite-teleport;
+# resolving it finds lib/bisquite-conf of the same package.
 SELF_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 # shellcheck source=/dev/null
 source "$SELF_DIR/lib/bisquite-conf"
@@ -89,9 +90,9 @@ BOUND_KEYPAIR_MIN=18.8.0
 TELEPORT_BIN="${TELEPORT_BIN:-/usr/local/bin/teleport}"
 JOIN_TIMEOUT="${BISQUITE_TELEPORT_JOIN_TIMEOUT:-120}"
 MANAGED_BY=bisquite-teleport-agent
-# The path the agent execs for the os_logins label: the link install.sh lays
-# down, not $0 — render also runs under a scratch root in the tests.
-OS_LOGINS_CMD=/usr/local/sbin/bisquite-teleport
+# The path the agent execs for the os_logins label: the link the package
+# ships, not $0 — render also runs under a scratch root in the tests.
+OS_LOGINS_CMD=/usr/sbin/bisquite-teleport
 # Teleport puts no limit on a label value, but the value travels in every
 # heartbeat, `tsh ls` and the portal; a list longer than this is cut at a
 # whole name and ends with `,...`.
@@ -301,7 +302,7 @@ node_labels(){
 }
 
 # ---------------------------------------------------------------------------
-# teleport.yaml — форма install.sh ldap-admin-api
+# teleport.yaml — узел, приложения, метки
 # ---------------------------------------------------------------------------
 cmd_render(){
     need_root
@@ -642,7 +643,7 @@ cmd_join(){
     local was_joined=0 server agent
     joined && was_joined=1
     agent="$(version_of_agent)"
-    [[ -n "$agent" ]] || die "$TELEPORT_BIN не отвечает на version — расширение не установлено?"
+    [[ -n "$agent" ]] || die "$TELEPORT_BIN не отвечает на version — Teleport не установлен?"
     # The agent may not be newer than the cluster (below), so an agent of
     # 18.8+ also guarantees the cluster side of bound_keypair.
     if [[ "$method" == bound_keypair ]] && semver_gt "$BOUND_KEYPAIR_MIN" "$agent"; then
@@ -1151,7 +1152,7 @@ cmd_labels_enable(){
     log "токен меток — в $LABELS_TOKEN (0600), адрес — $url"
     if has_systemd; then
         systemctl enable --now "$LABELS_TIMER" >/dev/null 2>&1 \
-            || warn "$LABELS_TIMER не включён — юнитов меток нет? Обновите расширение (update.sh)"
+            || warn "$LABELS_TIMER не включён — юнитов меток нет? Переустановите пакет bisquite-teleport-agent"
     fi
     cmd_pull
 }
@@ -1252,6 +1253,8 @@ case "${1:-}" in
     set-managed) shift; cmd_set_managed "$@" ;;
     pull) cmd_pull ;;
     labels-enable) shift; cmd_labels_enable "$@" ;;
+    # VERSION is written next to this script by the package build.
+    version|--version) cat "$SELF_DIR/VERSION" 2>/dev/null || echo dev ;;
     -h|--help|help|"") sed -n '2,${/^#/!q; s/^# \{0,1\}//; p}' "$0" ;;
-    *) die "неизвестная команда '$1' (join|set|leave|status|render|apply|os-logins|set-managed|pull|labels-enable)" ;;
+    *) die "неизвестная команда '$1' (join|set|leave|status|render|apply|os-logins|set-managed|pull|labels-enable|version)" ;;
 esac

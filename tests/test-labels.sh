@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2016  # literal $… in fakes and patterns is the test data
-# Тесты меток с портала расширения teleport-agent: set-managed, pull,
-# labels-enable, юниты таймера и update.sh — на подменённом корне
-# (BISQUITE_TELEPORT_ROOT), с поддельными curl, systemctl, dpkg и teleport в
-# PATH. root, systemd и сеть не нужны.
+# Тесты меток с портала: set-managed, pull, labels-enable и юниты таймера —
+# на подменённом корне (BISQUITE_TELEPORT_ROOT), с поддельными curl,
+# systemctl, dpkg и teleport в PATH. root, systemd и сеть не нужны.
 #
-#   tools/test-teleport-labels.sh        код 0 — все проверки прошли
+#   tests/test-labels.sh        код 0 — все проверки прошли
 
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "$HERE")"
-EXT="$REPO/extensions/debian/teleport-agent"
+SRC="$REPO/src"
 
 TMP="$(mktemp -d)"
 trap 'rm -r -f -- "$TMP"' EXIT
@@ -25,7 +24,7 @@ check_not(){ local what="$1"; shift; if "$@"; then bad "$what"; else ok; fi; }
 eq(){ local what="$1" want="$2" got="$3"; if [[ "$want" == "$got" ]]; then ok; else bad "$what: ждали [$want], получили [$got]"; fi; }
 
 TOKEN=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-abcde
-URL=https://stvor.example.org/robot-api/v1/labels
+URL=https://portal.example.org/robot-api/v1/labels
 REV_B=0123456789abcdef
 REV_C=fedcba9876543210
 
@@ -117,19 +116,18 @@ EOF
 
 fake_dpkg(){ printf '#!/bin/sh\necho amd64\n' > "$ROOT/bin/dpkg"; chmod +x "$ROOT/bin/dpkg"; }
 
-# The agent binary where install.sh and update.sh look for it.
+# The agent binary where join looks for it (TELEPORT_BIN).
 fake_teleport(){
     mkdir -p "$ROOT/usr/local/bin"
     printf '#!/bin/sh\necho "Teleport v%s git: go1.25"\n' "$1" > "$ROOT/usr/local/bin/teleport"
     chmod +x "$ROOT/usr/local/bin/teleport"
 }
 
-# The build layout: /opt/bisquite/teleport-agent with lib/ linked in.
+# The package layout: /usr/lib/bisquite-teleport with its own lib/.
 stage(){
-    mkdir -p "$ROOT/opt/bisquite"
-    cp -a "$EXT" "$ROOT/opt/bisquite/teleport-agent"
-    ln -sfn "$REPO/lib" "$ROOT/opt/bisquite/teleport-agent/lib"
-    STAGED="$ROOT/opt/bisquite/teleport-agent"
+    mkdir -p "$ROOT/usr/lib"
+    cp -aL "$SRC" "$ROOT/usr/lib/bisquite-teleport"
+    STAGED="$ROOT/usr/lib/bisquite-teleport"
     export FAKE_TP="$STAGED/bisquite-teleport"
 }
 lib(){ bash -c 'set -euo pipefail; source "$1"; shift; "$@"' _ "$REPO/lib/bisquite-conf" "$@"; }
@@ -246,11 +244,11 @@ echo "== labels-enable =="
 robot
 portal 200 prod sp-bbbbbbbb "$REV_B"
 check_not "labels-enable: URL не по шаблону — отказ (http)" \
-    bash -c 'printf %s "$1" | bash "$2" labels-enable URL=http://stvor.example.org/robot-api/v1/labels' _ "$TOKEN" "$STAGED/bisquite-teleport" 2>/dev/null
+    bash -c 'printf %s "$1" | bash "$2" labels-enable URL=http://portal.example.org/robot-api/v1/labels' _ "$TOKEN" "$STAGED/bisquite-teleport" 2>/dev/null
 check_not "labels-enable: URL с чужим путём — отказ" \
-    bash -c 'printf %s "$1" | bash "$2" labels-enable URL=https://stvor.example.org/api/v1/labels' _ "$TOKEN" "$STAGED/bisquite-teleport" 2>/dev/null
+    bash -c 'printf %s "$1" | bash "$2" labels-enable URL=https://portal.example.org/api/v1/labels' _ "$TOKEN" "$STAGED/bisquite-teleport" 2>/dev/null
 check_not "labels-enable: URL с кавычкой — отказ" \
-    bash -c 'printf %s "$1" | bash "$2" labels-enable "URL=https://stvor\".example.org/robot-api/v1/labels"' _ "$TOKEN" "$STAGED/bisquite-teleport" 2>/dev/null
+    bash -c 'printf %s "$1" | bash "$2" labels-enable "URL=https://portal\".example.org/robot-api/v1/labels"' _ "$TOKEN" "$STAGED/bisquite-teleport" 2>/dev/null
 check_not "labels-enable: без URL — отказ" \
     bash -c 'printf %s "$1" | bash "$2" labels-enable' _ "$TOKEN" "$STAGED/bisquite-teleport" 2>/dev/null
 check_not "labels-enable: токен не по шаблону — отказ" \
@@ -402,7 +400,7 @@ msg="$(tp set "TELEPORT_LABELS_URL=$URL" 2>&1)"; rc=$?
 check "TELEPORT_LABELS_URL через set — отказ (ro)" test "$rc" -ne 0
 check "TELEPORT_LABELS_URL через set — текст про labels-enable" grep -q 'labels-enable' <<< "$msg"
 check_not "TELEPORT_LABELS_URL через set: чужой путь — отказ" \
-    tp set TELEPORT_LABELS_URL=https://stvor.example.org/x 2>/dev/null
+    tp set TELEPORT_LABELS_URL=https://portal.example.org/x 2>/dev/null
 
 # ===========================================================================
 echo "== R3: перезапуск после записи подтверждается =="
@@ -546,234 +544,17 @@ check "join с TELEPORT_LABELS_URL — текст про labels-enable" grep -q 
 eq "join с TELEPORT_LABELS_URL — адрес не записан" "" "$(get TELEPORT_LABELS_URL)"
 
 # ===========================================================================
-echo "== install.sh: юниты меток в сборке =="
-new_root; stage; fake_teleport 18.10.0
-export BISQUITE_TELEPORT_SYSTEMD=0
-check "install.sh в staged-раскладке" bash "$STAGED/install.sh" 2>/dev/null
-for u in bisquite-teleport-labels.service bisquite-teleport-labels.timer; do
-    check "install.sh: $u в /etc/systemd/system" cmp -s "$STAGED/$u" "$ROOT/etc/systemd/system/$u"
-done
-check_not "install.sh: таймер не включён при сборке" test -e "$ROOT/etc/systemd/system/timers.target.wants/bisquite-teleport-labels.timer"
-check_not "install.sh: systemctl не зовётся" test -e "$FAKE/systemctl.log"
-check_not "install.sh: агент не скачивается, если версия та же" test -e "$FAKE/curl.argv"
-eq "install.sh: CLI — ссылка в каталог расширения" "$STAGED/bisquite-teleport" "$(readlink "$ROOT/usr/local/sbin/bisquite-teleport")"
-export BISQUITE_TELEPORT_SYSTEMD=1
-
+echo "== юниты таймера меток =="
 # Units: what the timer runs and when.
-svc="$EXT/bisquite-teleport-labels.service"; tmr="$EXT/bisquite-teleport-labels.timer"
+svc="$SRC/systemd/bisquite-teleport-labels.service"; tmr="$SRC/systemd/bisquite-teleport-labels.timer"
 check "юнит: oneshot" grep -qx 'Type=oneshot' "$svc"
 check "юнит: только при токене" grep -qx 'ConditionPathExists=/etc/bisquite/teleport/labels-token' "$svc"
-check "юнит: ExecStart — pull" grep -qx 'ExecStart=/usr/local/sbin/bisquite-teleport pull' "$svc"
+check "юнит: ExecStart — pull" grep -qx 'ExecStart=/usr/sbin/bisquite-teleport pull' "$svc"
 check "юнит: TimeoutStartSec=5min" grep -qx 'TimeoutStartSec=5min' "$svc"
 check "таймер: OnBootSec=1min" grep -qx 'OnBootSec=1min' "$tmr"
 check "таймер: OnUnitActiveSec=1min" grep -qx 'OnUnitActiveSec=1min' "$tmr"
 check "таймер: RandomizedDelaySec=20s" grep -qx 'RandomizedDelaySec=20s' "$tmr"
 check "таймер: WantedBy=timers.target" grep -qx 'WantedBy=timers.target' "$tmr"
-
-# ===========================================================================
-echo "== update.sh: архив git archive на работающем роботе =="
-# The archive exactly as the portal mirror makes it: `git archive <ref>
-# extensions/debian/teleport-agent lib | gzip -n`, here of the working tree
-# (a scratch index, so uncommitted files are in it too).
-make_archive(){
-    local idx="$TMP/index" tree
-    rm -f "$idx"
-    GIT_INDEX_FILE="$idx" git -C "$REPO" read-tree HEAD || return 1
-    GIT_INDEX_FILE="$idx" git -C "$REPO" add -- extensions/debian/teleport-agent lib || return 1
-    tree="$(GIT_INDEX_FILE="$idx" git -C "$REPO" write-tree)" || return 1
-    git -C "$REPO" archive "$tree" extensions/debian/teleport-agent lib | gzip -n > "$TMP/agent.tar.gz"
-}
-# The build's fingerprint of lib/ (bisquite: LinuxBuilder._library_digest).
-py_digest(){
-    python3 - "$1" <<'EOF'
-import hashlib, sys
-from pathlib import Path
-lib = Path(sys.argv[1]); d = hashlib.sha256()
-for item in sorted(lib.rglob("*")):
-    rel = item.relative_to(lib).as_posix()
-    if item.is_symlink(): d.update(f"L {rel} -> {item.readlink()}\0".encode())
-    elif item.is_file(): d.update(f"F {rel}\0".encode()); d.update(item.read_bytes()); d.update(b"\0")
-    elif item.is_dir(): d.update(f"D {rel}\0".encode())
-print(d.hexdigest())
-EOF
-}
-# A robot running an earlier build: agent 18.6.8 (older than the default of
-# install.sh — a wrong version would make install.sh download), joined, with
-# a config of its own.
-AGENT_V=18.6.8
-old_robot(){ # old_robot <extension root: /opt/bisquite or /opt/vmsetup>
-    new_root; fake_teleport "$AGENT_V"
-    local dir="$ROOT$1/teleport-agent"
-    mkdir -p "$dir" "$ROOT/usr/local/sbin" "$ROOT/var/lib/teleport" "$ROOT/etc/bisquite/teleport"
-    printf 'name: teleport-agent\nversion: 2.4.0\n' > "$dir/extension.yaml"
-    printf '#!/bin/sh\necho old\n' > "$dir/bisquite-teleport"; chmod +x "$dir/bisquite-teleport"
-    echo stale > "$dir/obsolete-file"
-    ln -sfn "$dir/bisquite-teleport" "$ROOT/usr/local/sbin/bisquite-teleport"
-    echo 11111111-2222 > "$ROOT/var/lib/teleport/host_uuid"
-    printf 'TELEPORT_PROXY=teleport.example.org\nTELEPORT_ENV=dev\nTELEPORT_LABELS=site=lab\n' \
-        > "$ROOT/etc/bisquite/teleport/config"
-    chmod 0600 "$ROOT/etc/bisquite/teleport/config"
-    rm -r -f "$TMP/unpacked"; mkdir -p "$TMP/unpacked"
-    # -p: as root on the robot, tar keeps the archive modes (0664/0775).
-    tar -xpzf "$TMP/agent.tar.gz" -C "$TMP/unpacked"
-    UPD="$TMP/unpacked/extensions/debian/teleport-agent/update.sh"
-}
-updated_ok(){ # updated_ok <label>
-    local t="$ROOT/opt/bisquite/teleport-agent" digest want
-    check "$1: update.sh — код 0" test "$rc" -eq 0
-    check "$1: версия 2.5.0 на месте" grep -qx 'version: 2.5.0' "$t/extension.yaml"
-    check_not "$1: файлы прежней версии убраны" test -e "$t/obsolete-file"
-    check "$1: юниты меток в каталоге" test -f "$t/bisquite-teleport-labels.timer"
-    digest="$(basename "$(readlink "$t/lib")")"
-    eq "$1: lib — ссылка на /opt/bisquite/lib/<sha256>" "$ROOT/opt/bisquite/lib/$digest" "$(readlink "$t/lib")"
-    check "$1: lib на месте" test -f "$ROOT/opt/bisquite/lib/$digest/bisquite-conf"
-    check "$1: lib исполняемый" test -x "$ROOT/opt/bisquite/lib/$digest/bisquite-conf"
-    eq "$1: запись группе и всем снята (git archive несёт 0664/0775)" "" \
-        "$(find "$t/" "$ROOT/opt/bisquite/lib/$digest/" -perm /022 ! -type l)"
-    if command -v python3 >/dev/null 2>&1; then
-        want="$(py_digest "$REPO/lib")"
-        eq "$1: отпечаток lib тот же, что у сборки" "$want" "$digest"
-    fi
-    eq "$1: CLI — ссылка на новый каталог" "$t/bisquite-teleport" "$(readlink "$ROOT/usr/local/sbin/bisquite-teleport")"
-    eq "$1: схема — ссылка на новый knobs" "$t/knobs" "$(readlink "$ROOT/opt/bisquite/knobs/teleport")"
-    for u in teleport.service bisquite-teleport-labels.service bisquite-teleport-labels.timer; do
-        check "$1: $u установлен" cmp -s "$t/$u" "$ROOT/etc/systemd/system/$u"
-    done
-    check "$1: daemon-reload" grep -qx 'daemon-reload' "$FAKE/systemctl.log"
-    check_not "$1: без токена меток таймер не включается" grep -q 'enable' "$FAKE/systemctl.log"
-    check_not "$1: агент не перезапускался" grep -q 'teleport.service' "$FAKE/systemctl.log"
-    check_not "$1: бинарь агента не скачивался" test -e "$FAKE/curl.argv"
-    check "$1: бинарь агента прежний" grep -q "v$AGENT_V" "$ROOT/usr/local/bin/teleport"
-    eq "$1: config сохранён — env" dev "$(get TELEPORT_ENV)"
-    eq "$1: config сохранён — прокси" teleport.example.org "$(get TELEPORT_PROXY)"
-    check "$1: регистрация цела" test -s "$ROOT/var/lib/teleport/host_uuid"
-    check "$1: новый CLI работает" bash -c 'bash "$1/usr/local/sbin/bisquite-teleport" status >/dev/null 2>&1' _ "$ROOT"
-}
-
-if ! command -v git >/dev/null 2>&1 || ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
-    # A container with only the tree mounted (python:3.12-slim): no git, no
-    # repository — said aloud, not passed silently.
-    echo "ПРОПУЩЕНО: update.sh — нет git или $REPO не git-репозиторий, архив не собрать" >&3
-elif make_archive; then
-    check "архив: update.sh внутри" bash -c 'tar -tzf "$1" | grep -qx "extensions/debian/teleport-agent/update.sh"' _ "$TMP/agent.tar.gz"
-    check "архив: lib внутри" bash -c 'tar -tzf "$1" | grep -qx "lib/bisquite-conf"' _ "$TMP/agent.tar.gz"
-
-    old_robot /opt/bisquite
-    out="$(bash "$UPD" 2>&1)"; rc=$?
-    [[ "$rc" -eq 0 ]] || echo "$out" >&3
-    updated_ok "раскладка /opt/bisquite"
-    check "раскладка /opt/bisquite: агент не тронут install.sh" grep -q 'агент Teleport v18.6.8 git: go1.25 не трогаю' <<< "$out"
-    reset_logs
-    out="$(bash "$UPD" 2>&1)"; rc=$?
-    eq "повторный update.sh — код 0" 0 "$rc"
-    eq "повторный update.sh — один каталог lib" 1 "$(find "$ROOT/opt/bisquite/lib" -mindepth 1 -maxdepth 1 | wc -l)"
-    check_not "повторный update.sh — временных каталогов нет" \
-        bash -c 'find "$1/opt/bisquite" -maxdepth 1 -name ".teleport-agent.*" | grep -q .' _ "$ROOT"
-
-    old_robot /opt/vmsetup
-    out="$(bash "$UPD" 2>&1)"; rc=$?
-    [[ "$rc" -eq 0 ]] || echo "$out" >&3
-    updated_ok "раскладка /opt/vmsetup"
-    check "раскладка /opt/vmsetup: старый каталог не тронут" test -f "$ROOT/opt/vmsetup/teleport-agent/obsolete-file"
-    check "раскладка /opt/vmsetup: сказано про старый путь" grep -q '/opt/vmsetup' <<< "$out"
-
-    # K1: a fork with a version suffix is never replaced.
-    AGENT_V=18.10.0-oidc old_robot /opt/bisquite
-    AGENT_V=18.10.0-oidc; out="$(bash "$UPD" 2>&1)"; rc=$?
-    [[ "$rc" -eq 0 ]] || echo "$out" >&3
-    updated_ok "форк v18.10.0-oidc"
-    AGENT_V=18.6.8
-
-    # With a labels token the timer is enabled right away.
-    old_robot /opt/bisquite
-    printf 'url=%s\ntoken=%s\n' "$URL" "$TOKEN" > "$ROOT/etc/bisquite/teleport/labels-token"
-    chmod 0600 "$ROOT/etc/bisquite/teleport/labels-token"
-    bash "$UPD" >/dev/null 2>&1
-    check "с токеном меток — таймер включён" grep -qx 'enable --now bisquite-teleport-labels.timer' "$FAKE/systemctl.log"
-
-    # install.sh fails (armhf): the previous directory comes back.
-    for layout in /opt/bisquite /opt/vmsetup; do
-        old_robot "$layout"
-        printf '#!/bin/sh\necho armhf\n' > "$ROOT/bin/dpkg"
-        link_before="$(readlink "$ROOT/usr/local/sbin/bisquite-teleport")"
-        bash "$UPD" >/dev/null 2>&1; rc=$?
-        check "$layout: install.sh упал — update.sh ≠ 0" test "$rc" -ne 0
-        if [[ "$layout" == /opt/bisquite ]]; then
-            check "$layout: install.sh упал — прежний каталог возвращён" \
-                grep -qx 'version: 2.4.0' "$ROOT/opt/bisquite/teleport-agent/extension.yaml"
-            check "$layout: install.sh упал — прежние файлы на месте" test -f "$ROOT/opt/bisquite/teleport-agent/obsolete-file"
-        else
-            check_not "$layout: install.sh упал — нового каталога нет" test -e "$ROOT/opt/bisquite/teleport-agent"
-            check "$layout: install.sh упал — старый каталог цел" test -f "$ROOT/opt/vmsetup/teleport-agent/obsolete-file"
-        fi
-        eq "$layout: install.sh упал — CLI смотрит туда же" "$link_before" "$(readlink "$ROOT/usr/local/sbin/bisquite-teleport")"
-        check_not "$layout: install.sh упал — временных каталогов нет" \
-            bash -c 'find "$1/opt/bisquite" -maxdepth 1 -name ".teleport-agent.*" | grep -q .' _ "$ROOT"
-    done
-
-    # install.sh fails after it rewired the CLI link and the units but before
-    # conf_init: the links, units and directory of the previous version come
-    # back, and the CLI renders with it. The previous version is the real
-    # teleport-agent 2.4.0 (OLD_REF), installed the way the build does it.
-    OLD_REF=99ec2a8
-    if git -C "$REPO" cat-file -e "$OLD_REF^{commit}" 2>/dev/null; then
-        git -C "$REPO" archive "$OLD_REF" extensions/debian/teleport-agent lib | gzip -n > "$TMP/old.tar.gz"
-        for layout in /opt/bisquite /opt/vmsetup; do
-            old_robot "$layout"
-            rm -r -f "$ROOT$layout/teleport-agent"
-            rm -r -f "$TMP/old"; mkdir -p "$TMP/old"; tar -xzf "$TMP/old.tar.gz" -C "$TMP/old"
-            cp -a "$TMP/old/extensions/debian/teleport-agent" "$ROOT$layout/teleport-agent"
-            mkdir -p "$ROOT/opt/bisquite/lib"
-            cp -a "$TMP/old/lib" "$ROOT/opt/bisquite/lib/old"
-            ln -sfn "$ROOT/opt/bisquite/lib/old" "$ROOT$layout/teleport-agent/lib"
-            ln -sfn "$ROOT$layout/teleport-agent/bisquite-teleport" "$ROOT/usr/local/sbin/bisquite-teleport"
-            bash -c 'set -euo pipefail; source "$1/lib/bisquite-conf"; conf_init teleport "$1/knobs"' _ "$ROOT$layout/teleport-agent"
-            lib conf_set teleport --allow-ro TELEPORT_NODENAME=robot-1 2>/dev/null
-            mkdir -p "$ROOT/etc/systemd/system"
-            cp "$TMP/old/extensions/debian/teleport-agent/teleport.service" "$ROOT/etc/systemd/system/"
-            before_cli="$(readlink "$ROOT/usr/local/sbin/bisquite-teleport")"
-            before_knobs="$(readlink "$ROOT/opt/bisquite/knobs/teleport")"
-            before_apply="$(readlink "$ROOT/opt/bisquite/knobs/teleport.apply")"
-            before_conf="$(readlink "$ROOT/usr/local/sbin/bisquite-conf")"
-            # The fake: conf_init of the new archive fails.
-            echo 'conf_init(){ return 1; }' >> "$TMP/unpacked/lib/bisquite-conf"
-            reset_logs
-            bash "$UPD" >/dev/null 2>&1; rc=$?
-            check "$layout, conf_init упал: update.sh ≠ 0" test "$rc" -ne 0
-            eq "$layout, conf_init упал: CLI — прежняя ссылка" "$before_cli" "$(readlink "$ROOT/usr/local/sbin/bisquite-teleport")"
-            eq "$layout, conf_init упал: схема — прежняя ссылка" "$before_knobs" "$(readlink "$ROOT/opt/bisquite/knobs/teleport")"
-            eq "$layout, conf_init упал: хук — прежняя ссылка" "$before_apply" "$(readlink "$ROOT/opt/bisquite/knobs/teleport.apply")"
-            eq "$layout, conf_init упал: bisquite-conf — прежняя ссылка" "$before_conf" "$(readlink "$ROOT/usr/local/sbin/bisquite-conf")"
-            check "$layout, conf_init упал: CLI ведёт в существующий файл" test -f "$ROOT/usr/local/sbin/bisquite-teleport"
-            check "$layout, conf_init упал: прежняя версия 2.4.0" \
-                grep -qx 'version: 2.4.0' "$(dirname "$(readlink -f "$ROOT/usr/local/sbin/bisquite-teleport")")/extension.yaml"
-            check "$layout, conf_init упал: юнит teleport.service прежний" \
-                cmp -s "$TMP/old/extensions/debian/teleport-agent/teleport.service" "$ROOT/etc/systemd/system/teleport.service"
-            check_not "$layout, conf_init упал: юнитов меток нет" test -e "$ROOT/etc/systemd/system/bisquite-teleport-labels.timer"
-            rm -f "$ROOT/etc/teleport.yaml"
-            check "$layout, conf_init упал: render прежней версией работает" \
-                bash -c 'bash "$1/usr/local/sbin/bisquite-teleport" render 2>/dev/null' _ "$ROOT"
-            check "$layout, conf_init упал: teleport.yaml собран" grep -q 'proxy_server: "teleport.example.org:443"' "$ROOT/etc/teleport.yaml"
-            check_not "$layout, conf_init упал: временных каталогов нет" \
-                bash -c 'find "$1/opt/bisquite" -maxdepth 1 -name ".teleport-agent.*" | grep -q .' _ "$ROOT"
-        done
-    else
-        echo "ПРОПУЩЕНО: откат ссылок update.sh — нет коммита $OLD_REF (teleport-agent 2.4.0)" >&3
-    fi
-
-    old_robot /opt/bisquite
-    rm -f "$ROOT/usr/local/bin/teleport"
-    out="$(bash "$UPD" 2>&1)"; rc=$?
-    check "агента нет — отказ" test "$rc" -ne 0
-    check "агента нет — каталог расширения не тронут" test -f "$ROOT/opt/bisquite/teleport-agent/obsolete-file"
-    check_not "агента нет — lib не разложен" test -d "$ROOT/opt/bisquite/lib"
-
-    old_robot /opt/bisquite
-    bash "$UPD" >/dev/null 2>&1
-    check_not "update.sh из установленного каталога — отказ" bash "$ROOT/opt/bisquite/teleport-agent/update.sh" 2>/dev/null
-else
-    bad "update.sh: git archive рабочего дерева не собрался"
-fi
 
 echo
 echo "проверок: $((pass + fail)), не прошло: $fail"

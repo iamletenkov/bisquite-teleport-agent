@@ -7,4 +7,4 @@ Type=oneshot
 # still there: without RemainAfterExit every boot ended in start-limit-hit
 # (AGX Orin, 2026-09-14). Scrubbing is idempotent, once per boot is enough.
 RemainAfterExit=yes
-ExecStart=/usr/local/sbin/bisquite-teleport scrub-token
+ExecStart=/usr/sbin/bisquite-teleport scrub-token
