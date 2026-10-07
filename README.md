@@ -42,7 +42,7 @@
    суммы:
 
    ```bash
-   V=3.0.0
+   V=3.0.1
    curl -fLO https://github.com/iamletenkov/bisquite-teleport-agent/releases/download/v$V/bisquite-teleport-agent_${V}_all.deb
    curl -fLO https://github.com/iamletenkov/bisquite-teleport-agent/releases/download/v$V/SHA256SUMS
    sha256sum -c SHA256SUMS
@@ -179,7 +179,7 @@ bisquite-teleport version           версия пакета
 | `TELEPORT_ENV` | фактически да | метка `env`; по ней роли кластера обычно и дают доступ |
 | `TELEPORT_CA_PIN` | нет | `sha256:…` из `tctl status`; у прокси с публичным сертификатом TLS проверяется и без него |
 | `TELEPORT_NODENAME` | нет | по умолчанию короткое имя хоста |
-| `TELEPORT_LABELS` | нет | `site=lab,robot=r1`; ключи `env`, `app`, `managed_by`, `os_logins`, `teleport.icon` — отказ |
+| `TELEPORT_LABELS` | нет | `site=lab,robot=r1`; ключи `env`, `app`, `managed_by`, `bisquite_agent_version`, `os_logins`, `teleport.icon` — отказ |
 | `TELEPORT_FORCE` | нет | `1` — переподключиться к тому же кластеру заново |
 
 Что делает `join`, по порядку:
@@ -320,7 +320,8 @@ ICON=laptop
 старта, а не испорченный YAML.
 
 - `ssh_service.listen_addr: 127.0.0.1:3022` — наружу порт не нужен;
-- метки ноды: `TELEPORT_LABELS`, `managed_by=bisquite-teleport-agent`, `env`;
+- метки ноды: `TELEPORT_LABELS`, `managed_by=bisquite-teleport-agent`,
+  `bisquite_agent_version=<версия пакета>`, `env`;
 - `join_params` — пока есть токен (`token`) или секрет (`bound_keypair`);
 - `commands` с `os_logins` — `["/usr/sbin/bisquite-teleport", "os-logins"]`.
 

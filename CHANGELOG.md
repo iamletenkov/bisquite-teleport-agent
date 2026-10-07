@@ -3,6 +3,13 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии —
 [SemVer](https://semver.org/lang/ru/).
 
+## [3.0.1] — 2026-10-07
+
+### Добавлено
+- Статическая метка узла `bisquite_agent_version=<версия пакета>` (из
+  `/usr/lib/bisquite-teleport/VERSION`): по инвентарю портал отличает пакет
+  3.x от расширения 2.x. Ключ в `TELEPORT_LABELS` зарезервирован.
+
 ## [3.0.0] — 2026-10-05
 
 Первый релиз отдельным проектом. Код — расширение `teleport-agent` 2.5.0

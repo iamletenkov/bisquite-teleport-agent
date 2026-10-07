@@ -90,6 +90,12 @@ BOUND_KEYPAIR_MIN=18.8.0
 TELEPORT_BIN="${TELEPORT_BIN:-/usr/local/bin/teleport}"
 JOIN_TIMEOUT="${BISQUITE_TELEPORT_JOIN_TIMEOUT:-120}"
 MANAGED_BY=bisquite-teleport-agent
+# Static node label with the package version (VERSION next to this script,
+# written by the package build): the portal tells the 3.x package from the
+# 2.x extension by it. No VERSION in X.Y.Z form (a run from the source tree) —
+# no label.
+AGENT_VERSION_LABEL=bisquite_agent_version
+RE_AGENT_VERSION='^[0-9]+\.[0-9]+\.[0-9]+$'
 # The path the agent execs for the os_logins label: the link the package
 # ships, not $0 — render also runs under a scratch root in the tests.
 OS_LOGINS_CMD=/usr/sbin/bisquite-teleport
@@ -184,6 +190,8 @@ check_labels(){
         case "${item%%=*}" in
             env|app|managed_by)
                 die "TELEPORT_LABELS: ключ '${item%%=*}' зарезервирован (env задаётся TELEPORT_ENV)" ;;
+            "$AGENT_VERSION_LABEL")
+                die "TELEPORT_LABELS: ключ '$AGENT_VERSION_LABEL' зарезервирован — метку версии ставит агент" ;;
             # A static label and a dynamic one of the same name: the dynamic
             # one wins in Teleport, so the operator's value would be silently
             # lost. Refused like env.
@@ -288,6 +296,14 @@ collect_apps(){
     done
 }
 
+# The package version from VERSION, or nothing when it is not X.Y.Z.
+package_version(){
+    local v=""
+    [[ -r "$SELF_DIR/VERSION" ]] && v="$(tr -d '[:space:]' < "$SELF_DIR/VERSION")"
+    [[ "$v" =~ $RE_AGENT_VERSION ]] && printf '%s' "$v"
+    return 0
+}
+
 node_labels(){
     local -A l=() ; local item k
     local -a items
@@ -296,6 +312,9 @@ node_labels(){
         for item in "${items[@]}"; do l[${item%%=*}]="${item#*=}"; done
     fi
     l[managed_by]="$MANAGED_BY"
+    local version
+    version="$(package_version)"
+    [[ -n "$version" ]] && l[$AGENT_VERSION_LABEL]="$version"
     # env last and never from TELEPORT_LABELS: it is the access decision.
     [[ -n "${C[TELEPORT_ENV]}" ]] && l[env]="${C[TELEPORT_ENV]}"
     for k in $(printf '%s\n' "${!l[@]}" | sort); do printf '%s\t%s\n' "$k" "${l[$k]}"; done

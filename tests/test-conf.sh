@@ -450,6 +450,22 @@ check "render" tp render
 check "teleport.yaml собран" grep -q 'proxy_server: "teleport.example.org:443"' "$ROOT/etc/teleport.yaml"
 check "метка env в teleport.yaml" grep -q '"env": "prod"' "$ROOT/etc/teleport.yaml"
 
+# Метка версии пакета агента: из VERSION рядом со скриптом (его кладёт сборка
+# пакета). Запуск из дерева исходников (VERSION нет) — метки нет.
+check_not "без VERSION — метки bisquite_agent_version нет" grep -q bisquite_agent_version "$ROOT/etc/teleport.yaml"
+printf '3.0.1\n' > "$STAGED/VERSION"
+check "render с VERSION" tp render
+check "метка bisquite_agent_version — версия пакета" \
+    grep -qxF '    "bisquite_agent_version": "3.0.1"' "$ROOT/etc/teleport.yaml"
+printf 'dev build\n' > "$STAGED/VERSION"
+check "render с VERSION не по форме" tp render
+check_not "VERSION не X.Y.Z — метки нет" grep -q bisquite_agent_version "$ROOT/etc/teleport.yaml"
+printf '3.0.1\n' > "$STAGED/VERSION"
+msg="$(tp set TELEPORT_LABELS=bisquite_agent_version=9.9.9 2>&1)"; rc=$?
+check "set TELEPORT_LABELS=bisquite_agent_version=… — отказ" test "$rc" -ne 0
+check "отказ называет ключ bisquite_agent_version" grep -q "ключ 'bisquite_agent_version' зарезервирован" <<< "$msg"
+check "render после метки версии" tp render
+
 # Динамическая метка os_logins: включена по умолчанию, выключается ручкой,
 # задать её оператор не может. Команда сама — на подменённом passwd.
 check "метка os_logins в teleport.yaml по умолчанию" \
