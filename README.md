@@ -377,6 +377,32 @@ make deb       # dist/bisquite-teleport-agent_<версия>_all.deb и dist/SHA
 
 Уязвимости — [SECURITY.md](SECURITY.md). Изменения — [CHANGELOG.md](CHANGELOG.md).
 
+### Как выпустить версию
+
+1. Поднять `VERSION` (`X.Y.Z`) и добавить в `CHANGELOG.md` секцию
+   `## [X.Y.Z] — ГГГГ-ММ-ДД`: её текст станет заметками релиза.
+2. `make check`, коммит в `main`, `git push origin main`.
+3. Тег и его push:
+
+   ```bash
+   git tag vX.Y.Z && git push origin vX.Y.Z
+   ```
+
+Workflow `Check` на тег `v*` после проверок запускает job `release`: сверяет
+тег с `VERSION` (и с `debian/changelog`, если он появится), собирает `.deb` и
+`SHA256SUMS` и создаёт релиз GitHub с заметками из `CHANGELOG.md`. Версия с
+`-rc`/`-beta`/`-alpha` выходит как pre-release (сейчас `tools/build-deb.sh`
+принимает только `X.Y.Z`); метку «Latest» получает только
+старшая стабильная версия. Если релиз уже есть, его файлы заменяются
+(`--clobber`), заметки не трогаются.
+
+Релиз из уже существующего тега (например, `v3.0.0` задним числом):
+Actions → Check → Run workflow, вход `tag` = `v3.0.0`, или
+
+```bash
+gh workflow run check.yml --ref main -f tag=v3.0.0
+```
+
 ## Лицензия
 
 [PolyForm Noncommercial 1.0.0](LICENSE), см. [NOTICE](NOTICE). Коммерческое
