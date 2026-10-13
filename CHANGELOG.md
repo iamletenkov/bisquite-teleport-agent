@@ -1,7 +1,8 @@
 # Изменения
 
-Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии —
-[SemVer](https://semver.org/lang/ru/).
+Версии — [SemVer](https://semver.org/lang/ru/). Секции новее 3.0.1 пишет
+release-please из Conventional Commits; 3.0.1 и старше написаны вручную в
+формате [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/).
 
 ## [3.0.1] — 2026-10-07
 

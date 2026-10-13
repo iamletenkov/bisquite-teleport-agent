@@ -379,28 +379,25 @@ make deb       # dist/bisquite-teleport-agent_<версия>_all.deb и dist/SHA
 
 ### Как выпустить версию
 
-1. Поднять `VERSION` (`X.Y.Z`) и добавить в `CHANGELOG.md` секцию
-   `## [X.Y.Z] — ГГГГ-ММ-ДД`: её текст станет заметками релиза.
-2. `make check`, коммит в `main`, `git push origin main`.
-3. Тег и его push:
+Версию и `CHANGELOG.md` ведёт [release-please](https://github.com/googleapis/release-please)
+(`.github/release_please/`), workflow `CI and Release`:
 
-   ```bash
-   git tag vX.Y.Z && git push origin vX.Y.Z
-   ```
+1. Сливаешь в `main` коммиты по [Conventional Commits](https://www.conventionalcommits.org/ru/):
+   `fix:` поднимает patch, `feat:` — minor, `!` или `BREAKING CHANGE:` — major;
+   `docs:`, `ci:`, `chore:` версию не трогают.
+2. После проверок на `main` release-please открывает (и дальше обновляет)
+   PR «chore(main): release X.Y.Z» — он поднимает `VERSION` и дописывает
+   секцию в `CHANGELOG.md`.
+3. Владелец сливает этот PR. release-please создаёт тег `vX.Y.Z` и
+   опубликованный релиз с заметками из секции, затем job
+   `release-artifacts` собирает из тега `.deb` и `SHA256SUMS` и прикладывает
+   их к релизу.
 
-Workflow `Check` на тег `v*` после проверок запускает job `release`: сверяет
-тег с `VERSION` (и с `debian/changelog`, если он появится), собирает `.deb` и
-`SHA256SUMS` и создаёт релиз GitHub с заметками из `CHANGELOG.md`. Версия с
-`-rc`/`-beta`/`-alpha` выходит как pre-release (сейчас `tools/build-deb.sh`
-принимает только `X.Y.Z`); метку «Latest» получает только
-старшая стабильная версия. Если релиз уже есть, его файлы заменяются
-(`--clobber`), заметки не трогаются.
-
-Релиз из уже существующего тега (например, `v3.0.0` задним числом):
-Actions → Check → Run workflow, вход `tag` = `v3.0.0`, или
+Теги руками не ставят. Если сборка файлов упала, релиз уже виден без них:
+«Re-run failed jobs» в том же прогоне или ручной запуск с `release_tag`:
 
 ```bash
-gh workflow run check.yml --ref main -f tag=v3.0.0
+gh workflow run ci-release.yml --ref main -f release_tag=vX.Y.Z
 ```
 
 ## Лицензия
