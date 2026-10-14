@@ -18,7 +18,9 @@
 - метки `space` и `env` с портала, реализующего контракт
   [`GET /robot-api/v1/labels`](docs/portal-labels-api.md) (например, Stvor).
 
-Поддерживается Debian 12 (bookworm), `amd64` и `arm64`; пакет архитектурно
+Поддерживаются Debian 12 (bookworm), Debian 13 (trixie), Ubuntu 24.04 LTS
+и 22.04 LTS, `amd64` и `arm64` (на `amd64` все четыре проверены установкой
+пакета и регистрацией ноды в контейнерах); пакет архитектурно
 независимый (`_all.deb`: bash, юниты, схема). Проект вырос из расширения
 `teleport-agent` репозитория
 [bisquite-extensions](https://github.com/iamletenkov/bisquite-extensions);
