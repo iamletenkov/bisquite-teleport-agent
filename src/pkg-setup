@@ -46,6 +46,8 @@ UNITS=(teleport.service bisquite-teleport-apps.path bisquite-teleport-apps.servi
        bisquite-teleport-labels.service bisquite-teleport-labels.timer)
 PATH_UNITS=(bisquite-teleport-apps.path bisquite-teleport-token.path)
 LABELS_TIMER=bisquite-teleport-labels.timer
+# Retries of a join that waits for the network: enabled by join only.
+JOIN_TIMER=bisquite-teleport-join.timer
 # What only a teleport.service of the 2.x extension carries.
 LEGACY_MARK=/usr/local/sbin/bisquite-teleport
 
@@ -167,7 +169,7 @@ cmd_configure(){
 # (a removal must not cut the session it was started from).
 cmd_prerm_remove(){
     if has_systemd; then
-        systemctl stop "$LABELS_TIMER" "${PATH_UNITS[@]}" 2>/dev/null || true
+        systemctl stop "$LABELS_TIMER" "$JOIN_TIMER" "${PATH_UNITS[@]}" 2>/dev/null || true
     fi
     if [[ -s "$ROOT/var/lib/teleport/host_uuid" ]]; then
         warn "регистрация в /var/lib/teleport и /etc/bisquite/teleport остаётся, в том числе при purge; отключиться — sudo bisquite-teleport leave до удаления пакета"

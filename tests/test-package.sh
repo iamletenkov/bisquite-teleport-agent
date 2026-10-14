@@ -28,6 +28,8 @@ command -v dpkg-deb >/dev/null || { echo "нет dpkg-deb — пропущено
 UNITS=(teleport.service bisquite-teleport-apps.path bisquite-teleport-apps.service
        bisquite-teleport-token.path bisquite-teleport-token.service
        bisquite-teleport-labels.service bisquite-teleport-labels.timer)
+# Units that 2.x never had: in the package, never migrated.
+NEW_UNITS=(bisquite-teleport-join.service bisquite-teleport-join.timer)
 VERSION="$(tr -d '[:space:]' < "$REPO/VERSION")"
 
 # ===========================================================================
@@ -51,7 +53,7 @@ for f in usr/lib/bisquite-teleport/bisquite-teleport usr/lib/bisquite-teleport/k
          usr/share/doc/bisquite-teleport-agent/copyright; do
     check "в пакете $f" grep -q " \./$f\$" <<< "$contents"
 done
-for u in "${UNITS[@]}"; do
+for u in "${UNITS[@]}" "${NEW_UNITS[@]}"; do
     check "в пакете юнит $u" grep -q " \./usr/lib/systemd/system/$u\$" <<< "$contents"
 done
 check "/usr/sbin/bisquite-teleport — ссылка" grep -q '\./usr/sbin/bisquite-teleport -> ../lib/bisquite-teleport/bisquite-teleport$' <<< "$contents"
@@ -102,6 +104,8 @@ for u in bisquite-teleport-apps.path bisquite-teleport-token.path; do
 done
 check_not "teleport.service не включён" test -e "$ROOT/etc/systemd/system/multi-user.target.wants/teleport.service"
 check_not "таймер меток не включён" test -L "$ROOT/etc/systemd/system/timers.target.wants/bisquite-teleport-labels.timer"
+check_not "таймер повтора join не включён" test -L "$ROOT/etc/systemd/system/timers.target.wants/bisquite-teleport-join.timer"
+check_not "служба повтора join не включена" test -L "$ROOT/etc/systemd/system/multi-user.target.wants/bisquite-teleport-join.service"
 check_not "ссылки /usr/local/sbin/bisquite-teleport нет" test -L "$ROOT/usr/local/sbin/bisquite-teleport"
 check_not "teleport.yaml не создан" test -e "$ROOT/etc/teleport.yaml"
 check "подсказка про join" grep -q 'bisquite-teleport join' <<< "$out"
@@ -221,11 +225,14 @@ eq "битая ссылка bisquite-conf — на копию пакета" "$RO
 # ===========================================================================
 echo "== prerm / postrm =="
 old_robot; unpack; postinst 2>/dev/null
+# A join that waits for the network: its retry units are enabled.
+ln -s /usr/lib/systemd/system/bisquite-teleport-join.service "$ROOT/etc/systemd/system/multi-user.target.wants/"
+ln -s /usr/lib/systemd/system/bisquite-teleport-join.timer "$ROOT/etc/systemd/system/timers.target.wants/"
 before="$(snapshot)"
 rm -f "$FAKE/systemctl.log"
 out="$(BISQUITE_TELEPORT_SYSTEMD=1 sh "$ROOT/DEBIAN/prerm" remove 2>&1)"; rc=$?
 eq "prerm remove — код 0" 0 "$rc"
-check "prerm: таймер и path-юниты остановлены" grep -qx 'stop bisquite-teleport-labels.timer bisquite-teleport-apps.path bisquite-teleport-token.path' "$FAKE/systemctl.log"
+check "prerm: таймеры и path-юниты остановлены" grep -qx 'stop bisquite-teleport-labels.timer bisquite-teleport-join.timer bisquite-teleport-apps.path bisquite-teleport-token.path' "$FAKE/systemctl.log"
 check_not "prerm: агент не остановлен" grep -q 'teleport\.service' "$FAKE/systemctl.log"
 check "prerm: сказано про leave" grep -q 'bisquite-teleport leave' <<< "$out"
 check "prerm upgrade — код 0, ничего" sh "$ROOT/DEBIAN/prerm" upgrade "$VERSION"
@@ -242,7 +249,8 @@ eq "postrm remove: регистрация и настройки — ни бай�
 out="$(sh "$TMP/postrm" purge 2>&1)"; rc=$?
 eq "postrm purge — код 0" 0 "$rc"
 for w in multi-user.target.wants/teleport.service paths.target.wants/bisquite-teleport-apps.path \
-         paths.target.wants/bisquite-teleport-token.path timers.target.wants/bisquite-teleport-labels.timer; do
+         paths.target.wants/bisquite-teleport-token.path timers.target.wants/bisquite-teleport-labels.timer \
+         multi-user.target.wants/bisquite-teleport-join.service timers.target.wants/bisquite-teleport-join.timer; do
     check_not "purge: ссылка $w снята" test -L "$ROOT/etc/systemd/system/$w"
 done
 eq "purge: регистрация и настройки — ни байта" "$before" "$(snapshot)"

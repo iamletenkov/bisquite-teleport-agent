@@ -11,6 +11,7 @@
 #   bisquite-teleport set-managed env=… space=…   метки, которыми управляет портал
 #   bisquite-teleport pull              забрать метки с портала и применить (зовёт таймер)
 #   bisquite-teleport labels-enable URL=…   включить автоприменение (токен — со stdin)
+#   bisquite-teleport join-retry        повторить ждущий сети join (зовёт таймер)
 #   bisquite-teleport version           версия пакета агента
 #
 # Ручки — /etc/bisquite/teleport/config (0600), домен `teleport` библиотеки
@@ -52,6 +53,15 @@
 # Секрет лежит в /var/lib/bisquite/teleport/registration-secret (0600) до
 # регистрации и стирается после неё; связанный ключ агент хранит в своём
 # /var/lib/teleport, и повторные подключения секрета не требуют.
+#
+# Нет сети или прокси при join (первая загрузка): параметры уже в config
+# (0600), секрет — в registration-secret (0600); join пишет
+# /var/lib/bisquite/teleport/join-pending, включает
+# bisquite-teleport-join.{service,timer} и выходит с кодом 0. Служба повторяет
+# при каждой загрузке после network-online, таймер — раз в минуту, пока нода
+# не зарегистрирована; успех стирает секрет и выключает повторы. Отказ
+# кластера (секрет неверен или истёк, токена нет, ключ уже связан с другой
+# машиной) не повторяется: причина — в join-refused, код ≠ 0, `status`.
 #
 # Объявления расширений — /etc/bisquite/teleport/apps.d/<имя>.conf, root:root,
 # не шире 0644, два обязательных ключа и один необязательный:
@@ -142,6 +152,15 @@ RESTART_PAUSE=900
 LABELS_LOCKED=0
 LABELS_TIMER=bisquite-teleport-labels.timer
 RESTART_TIMEOUT="${BISQUITE_TELEPORT_RESTART_TIMEOUT:-30}"
+# A join that waits for the network or the proxy. join-pending exists while
+# it waits (`since=`, `attempts=`, `last=`, `error=`) and is the condition of
+# the retry service; join-refused holds the cluster's refusal (`at=`,
+# `reason=`, `detail=`). Both 0600 in the 0700 state directory.
+JOIN_PENDING="$STATE/join-pending"
+JOIN_REFUSED="$STATE/join-refused"
+JOIN_SERVICE=bisquite-teleport-join.service
+JOIN_TIMER=bisquite-teleport-join.timer
+JOIN_LOCKED=0
 
 log(){ >&2 echo "bisquite-teleport: $*"; }
 warn(){ log "ВНИМАНИЕ: $*"; }
@@ -571,11 +590,228 @@ semver_gt(){
     return 1
 }
 
-# Echo the server version; return 1 if the proxy is unreachable over verified TLS.
+# Echo the server version; on failure return curl's exit code — the proxy is
+# not reachable over verified TLS. Any failure here is "not yet": DNS, connect,
+# timeout, TLS (the clock of a fresh machine may still be wrong), an HTTP
+# error of a balancer in front of the proxy, an answer without server_version
+# (a captive portal, not a Teleport proxy) — code 100.
 probe_proxy(){
-    local proxy="$1" body
-    body="$(curl -fsS --max-time 15 "https://$proxy/webapi/find" 2>/dev/null)" || return 1
-    grep -oE '"server_version":"[^"]+"' <<< "$body" | head -1 | cut -d'"' -f4
+    local proxy="$1" body rc version
+    body="$(curl -fsS --max-time 15 "https://$proxy/webapi/find" 2>/dev/null)" || { rc=$?; return "$rc"; }
+    version="$(grep -oE '"server_version":"[^"]+"' <<< "$body" | head -1 | cut -d'"' -f4)"
+    [[ -n "$version" ]] || return 100
+    printf '%s\n' "$version"
+}
+
+# What the curl code of probe_proxy means, for the journal and `status`.
+net_reason(){
+    case "$1" in
+        5|6) echo "имя не разрешается — DNS (curl $1)" ;;
+        7) echo "соединение не установлено (curl 7)" ;;
+        28) echo "таймаут (curl 28)" ;;
+        22) echo "прокси ответил ошибкой HTTP (curl 22)" ;;
+        35|51|53|54|58|59|60|64|66|77|80|83|90|91)
+            echo "TLS не сошёлся — часы ещё не синхронизированы? (curl $1)" ;;
+        52|55|56) echo "соединение оборвано (curl $1)" ;;
+        100) echo "ответ не от прокси Teleport — нет server_version в /webapi/find" ;;
+        *) echo "curl $1" ;;
+    esac
+}
+
+# The agent may not be newer than the cluster nor older by more than a major.
+# Echo the reason and return 0 on a mismatch.
+version_mismatch(){
+    local agent="$1" server="$2"
+    if semver_gt "$agent" "$server"; then
+        echo "агент $agent новее кластера $server — Teleport такую связку не поддерживает"; return 0
+    fi
+    if (( ${server%%.*} - ${agent%%.*} > 1 )); then
+        echo "агент $agent старше кластера $server больше чем на мажор"; return 0
+    fi
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Отказ кластера или «ещё нет»: что агент пишет в журнал
+# ---------------------------------------------------------------------------
+# The join service of Teleport 18 (lib/join) sends its refusal to the agent,
+# and the agent logs it on every retry — "Failed to establish connection to
+# cluster." with the error, or "Can not join the cluster, the token is expired
+# or not found." None of these is ever a network error, so a match is final:
+# retrying only hammers the auth server. Anything else (connection refused, no
+# such host, i/o timeout, TLS) is "not yet".
+#   pattern (ERE, case-insensitive) | reason for `status`
+JOIN_REFUSALS=(
+    'a valid registration secret is required|секрет регистрации неверен или истёк'
+    'token (is )?expired or not found|токен регистрации не найден или истёк (робот удалён или секрет перевыпущен)'
+    'no recovery attempts remaining|failed to complete challenge|invalid challenge document|join state (verification failed|could not be verified)|токен уже использован: робот подключён с другой машины или её ключ потерян'
+    'does not allow role|is not for .bound_keypair. method|ambiguous token name|bad backend state|токен не подходит этой машине (метод или роли)'
+)
+
+# refusal_reason <agent log> — echo the reason of the first refusal found.
+refusal_reason(){
+    local entry
+    for entry in "${JOIN_REFUSALS[@]}"; do
+        if grep -qiE -- "${entry%|*}" <<< "$1"; then
+            printf '%s' "${entry##*|}"; return 0
+        fi
+    done
+    return 1
+}
+
+# The last line in which the agent reports a failed join, one line, at most
+# 300 characters, control characters dropped (it goes to a state file).
+last_join_error(){
+    local line
+    line="$(grep -iE 'establish connection to cluster|can not join the cluster|registration secret' <<< "$1" | tail -n 1)"
+    line="$(printf '%s' "$line" | tr -d '\000-\037\177')"
+    printf '%s' "${line:0:300}"
+}
+
+# The journal of teleport.service since an epoch. Into a variable, not a pipe
+# into grep -q (see app_role_missing).
+agent_log_since(){
+    has_systemd || return 0
+    journalctl -u teleport.service --since "@$1" --no-pager -o cat 2>/dev/null || true
+}
+
+# One join at a time: a person, the firstboot line and the retry timer may
+# meet. join_lock wait|nowait.
+join_lock(){
+    (( JOIN_LOCKED )) && return 0
+    install -d -m 0700 "$STATE" || die "не создать $STATE"
+    if command -v flock >/dev/null 2>&1; then
+        exec 8> "$STATE/.join.lock"
+        if [[ "$1" == wait ]]; then
+            flock -w "$((JOIN_TIMEOUT + 60))" 8 || return 1
+        else
+            flock -n 8 || return 1
+        fi
+    fi
+    JOIN_LOCKED=1
+}
+
+# A one-line value for a state file.
+one_line(){ printf '%s' "$1" | tr -d '\000-\037\177' | cut -c 1-300; }
+
+read_pending(){
+    local line
+    PEND_SINCE=""; PEND_ATTEMPTS=0; PEND_LAST=""; PEND_ERROR=""
+    [[ -f "$JOIN_PENDING" ]] || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            since=*) [[ "${line#since=}" =~ ^[0-9]{1,12}$ ]] && PEND_SINCE="${line#since=}" ;;
+            attempts=*) [[ "${line#attempts=}" =~ ^[0-9]{1,9}$ ]] && PEND_ATTEMPTS="${line#attempts=}" ;;
+            last=*) [[ "${line#last=}" =~ ^[0-9]{1,12}$ ]] && PEND_LAST="${line#last=}" ;;
+            error=*) PEND_ERROR="${line#error=}" ;;
+        esac
+    done < "$JOIN_PENDING"
+    return 0
+}
+
+read_refused(){
+    local line
+    REF_AT=""; REF_REASON=""; REF_DETAIL=""
+    [[ -f "$JOIN_REFUSED" ]] || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            at=*) [[ "${line#at=}" =~ ^[0-9]{1,12}$ ]] && REF_AT="${line#at=}" ;;
+            reason=*) REF_REASON="${line#reason=}" ;;
+            detail=*) REF_DETAIL="${line#detail=}" ;;
+        esac
+    done < "$JOIN_REFUSED"
+    return 0
+}
+
+# One more failed attempt of a waiting join: the counter, the time, the error.
+join_wait_record(){
+    local now
+    now="$(now_epoch)"
+    read_pending || true
+    write_state "$JOIN_PENDING" "since=${PEND_SINCE:-$now}"$'\n'"attempts=$((PEND_ATTEMPTS + 1))"$'\n'"last=$now"$'\n'"error=$(one_line "$1")" \
+        || die "не записано $JOIN_PENDING"
+}
+
+# The join waits: record the attempt, retry at every boot and every minute.
+# `start --no-block`: join may run inside a unit ordered before
+# network-online.target, and a waiting start job would deadlock it.
+join_defer(){
+    rm -f -- "$JOIN_REFUSED"
+    join_wait_record "$1"
+    has_systemd || return 0
+    systemctl enable "$JOIN_SERVICE" "$JOIN_TIMER" >/dev/null 2>&1 \
+        || warn "$JOIN_TIMER не включён — юнитов повтора нет? Переустановите пакет bisquite-teleport-agent"
+    systemctl start --no-block "$JOIN_TIMER" >/dev/null 2>&1 || true
+}
+
+# Registered: no more retries, the agent starts at every boot. The service is
+# disabled without --now — the tick that calls this runs inside it.
+join_settle(){
+    rm -f -- "$JOIN_PENDING" "$JOIN_REFUSED"
+    has_systemd || return 0
+    systemctl enable teleport.service >/dev/null 2>&1 || true
+    systemctl disable "$JOIN_SERVICE" >/dev/null 2>&1 || true
+    systemctl disable --now "$JOIN_TIMER" >/dev/null 2>&1 || true
+}
+
+# The cluster refused: no retries, the agent off (it would repeat the refusal
+# every 90 s forever), the secret gone — it is spent or wrong either way, the
+# way out is a new one. join_refuse <reason> <agent's line>
+join_refuse(){
+    rm -f -- "$JOIN_PENDING" "$REG_SECRET"
+    if has_systemd; then
+        systemctl disable --now teleport.service >/dev/null 2>&1 || true
+        systemctl disable "$JOIN_SERVICE" >/dev/null 2>&1 || true
+        systemctl disable --now "$JOIN_TIMER" >/dev/null 2>&1 || true
+    fi
+    # The YAML drops the path of the scrubbed secret.
+    [[ -n "${C[TELEPORT_PROXY]}" ]] && cmd_render
+    write_state "$JOIN_REFUSED" "at=$(now_epoch)"$'\n'"reason=$(one_line "$1")"$'\n'"detail=$(one_line "$2")" \
+        || warn "не записано $JOIN_REFUSED"
+}
+
+JOIN_HINT="новый секрет — в карточке робота Stvor («Новый секрет»), затем выполните строку подключения снова (вручную или через RustDesk)"
+
+# One attempt with the agent: start it unless it runs, wait for the identity
+# or a refusal. 0 — registered; 1 — refused (REFUSAL, REFUSAL_DETAIL);
+# 2 — not yet (ATTEMPT_ERROR).
+attempt_register(){
+    local since waited=0 agent_log="" line
+    REFUSAL=""; REFUSAL_DETAIL=""; ATTEMPT_ERROR=""
+    since="$(date +%s)"
+    if ! agent_active; then
+        if ! systemctl start teleport.service; then
+            ATTEMPT_ERROR="teleport.service не стартовал — journalctl -u teleport"
+            return 2
+        fi
+    fi
+    log "жду регистрации (до ${JOIN_TIMEOUT} с)…"
+    while :; do
+        joined && return 0
+        agent_log="$(agent_log_since "$since")"
+        if REFUSAL="$(refusal_reason "$agent_log")"; then
+            REFUSAL_DETAIL="$(last_join_error "$agent_log")"
+            return 1
+        fi
+        (( waited < JOIN_TIMEOUT )) || break
+        sleep 2; waited=$((waited + 2))
+    done
+    line="$(last_join_error "$agent_log")"
+    ATTEMPT_ERROR="прокси отвечает, регистрация не подтвердилась за ${JOIN_TIMEOUT} с${line:+: $line}"
+    return 2
+}
+
+# Put the previous registration back (join with a working registration failed).
+restore_rollback(){
+    systemctl stop teleport.service
+    find "$DATA" -mindepth 1 -maxdepth 1 -exec rm -r -f -- {} +
+    find "$ROLLBACK/data" -mindepth 1 -maxdepth 1 -exec mv -t "$DATA" -- {} +
+    [[ -f "$ROLLBACK/config" ]] && cp -a "$ROLLBACK/config" "$CONF"
+    [[ -f "$ROLLBACK/teleport.yaml" ]] && cp -a "$ROLLBACK/teleport.yaml" "$YAML"
+    # The restored registration has its own identity; the new secret goes.
+    rm -f -- "$REG_SECRET"
+    systemctl start teleport.service
+    rm -r -f -- "$ROLLBACK"
 }
 
 cmd_join(){
@@ -634,6 +870,8 @@ cmd_join(){
     check_labels "${N[TELEPORT_LABELS]:-}"
     N[TELEPORT_PROXY]="$(proxy_with_port "${N[TELEPORT_PROXY]}")"
 
+    # The retry timer and a person (or a rerun of firstboot) meet here.
+    join_lock wait || die "идёт другой join (повтор по таймеру?) — повторите позже"
     load_conf
     local old_proxy="${C[TELEPORT_PROXY]}"
     [[ -n "$old_proxy" ]] && old_proxy="$(proxy_with_port "$old_proxy")"
@@ -648,6 +886,8 @@ cmd_join(){
             pairs+=("$key=${N[$key]}")
         done
         save_conf "${pairs[@]}"
+        # The agent registered on its own while the join waited for the network.
+        if [[ -f "$JOIN_PENDING" ]]; then scrub_token; join_settle; fi
         apply_running
         return 0
     fi
@@ -659,7 +899,7 @@ cmd_join(){
         warn "TELEPORT_ENV не задан: ноду и приложения увидят только роли access/editor"
 
     # 2. Preflight before touching anything.
-    local was_joined=0 server agent
+    local was_joined=0 server agent prc=0 mismatch
     joined && was_joined=1
     agent="$(version_of_agent)"
     [[ -n "$agent" ]] || die "$TELEPORT_BIN не отвечает на version — Teleport не установлен?"
@@ -668,20 +908,14 @@ cmd_join(){
     if [[ "$method" == bound_keypair ]] && semver_gt "$BOUND_KEYPAIR_MIN" "$agent"; then
         die "bound_keypair: нужен агент версии не ниже $BOUND_KEYPAIR_MIN, установлен $agent — пересоберите образ с TELEPORT_VERSION ≥ $BOUND_KEYPAIR_MIN"
     fi
-    if server="$(probe_proxy "${N[TELEPORT_PROXY]}")"; then
+    server="$(probe_proxy "${N[TELEPORT_PROXY]}")" || prc=$?
+    if (( prc == 0 )); then
         if [[ -n "$server" ]]; then
-            if semver_gt "$agent" "$server"; then
-                die "агент $agent новее кластера $server — Teleport такую связку не поддерживает"
-            fi
-            if (( ${server%%.*} - ${agent%%.*} > 1 )); then
-                die "агент $agent старше кластера $server больше чем на мажор"
-            fi
+            mismatch="$(version_mismatch "$agent" "$server")" && die "$mismatch"
             log "прокси ${N[TELEPORT_PROXY]} отвечает, кластер $server, агент $agent"
         fi
     elif (( was_joined )); then
-        die "прокси ${N[TELEPORT_PROXY]} недоступен по https — рабочую регистрацию не трогаю"
-    else
-        warn "прокси ${N[TELEPORT_PROXY]} пока недоступен — агент будет повторять попытки"
+        die "прокси ${N[TELEPORT_PROXY]} недоступен по https ($(net_reason "$prc")) — рабочую регистрацию не трогаю"
     fi
 
     # 3. Keep the previous state for a rollback.
@@ -694,6 +928,8 @@ cmd_join(){
         find "$DATA" -mindepth 1 -maxdepth 1 -exec mv -t "$ROLLBACK/data" -- {} +
     fi
     install -d -m 0750 "$DATA"
+    # This join replaces whatever an earlier one left: a wait or a refusal.
+    rm -f -- "$JOIN_PENDING" "$JOIN_REFUSED"
 
     # A new cluster invalidates the old pin unless a new one came with it.
     pairs=()
@@ -711,43 +947,118 @@ cmd_join(){
         log "systemd не запущен — конфиг записан, агент стартует при загрузке"
         return 0
     fi
-    systemctl enable teleport.service >/dev/null 2>&1
-    systemctl start teleport.service
 
-    # 4. Wait for the identity.
-    local waited=0
-    log "жду регистрации (до ${JOIN_TIMEOUT} с)…"
-    while (( waited < JOIN_TIMEOUT )); do
-        if joined; then
+    # 3a. No network or proxy (first boot): everything is on disk — the
+    #     knobs in $CONF, the secret in $REG_SECRET, both 0600. The retry
+    #     units take over; the agent itself stays off until the proxy
+    #     answers, so a refusal is seen by them and not repeated forever.
+    if (( prc )); then
+        rm -r -f -- "$ROLLBACK"
+        systemctl disable teleport.service >/dev/null 2>&1 || true
+        join_defer "прокси ${N[TELEPORT_PROXY]} недоступен: $(net_reason "$prc")"
+        log "сеть или прокси ${N[TELEPORT_PROXY]} недоступны ($(net_reason "$prc")) — параметры и секрет сохранены (0600), регистрация повторится после появления сети: при каждой загрузке и раз в минуту. Ход — bisquite-teleport status"
+        return 0
+    fi
+
+    # 4. Wait for the identity or a refusal.
+    attempt_register
+    case $? in
+        0)
             rm -r -f -- "$ROLLBACK"
             scrub_token
+            join_settle
             log "нода $(nodename) зарегистрирована в ${C[TELEPORT_PROXY]}"
             # Apps join after the node; give app_service a moment to fail.
             if [[ -n "$(collect_apps 2>/dev/null)" ]]; then
                 sleep 15
                 if app_role_missing; then warn "$APP_ROLE_HINT"; return 2; fi
             fi
-            return 0
-        fi
-        sleep 2; waited=$((waited + 2))
-    done
+            return 0 ;;
+        1)
+            if [[ -s "$ROLLBACK/data/host_uuid" ]]; then
+                warn "кластер отказал: $REFUSAL — возвращаю прежнее подключение"
+                restore_rollback
+                die "join не удался (${REFUSAL_DETAIL:-$REFUSAL}), прежняя регистрация восстановлена"
+            fi
+            rm -r -f -- "$ROLLBACK"
+            join_refuse "$REFUSAL" "$REFUSAL_DETAIL"
+            log "ответ агента: ${REFUSAL_DETAIL:-—}"
+            die "кластер отказал в регистрации: $REFUSAL. Повторов не будет: $JOIN_HINT" ;;
+    esac
 
-    # 5. Timed out.
+    # 5. Not confirmed in time, no refusal seen.
     if [[ -s "$ROLLBACK/data/host_uuid" ]]; then
         warn "регистрация не подтвердилась за ${JOIN_TIMEOUT} с — возвращаю прежнее подключение"
-        systemctl stop teleport.service
-        find "$DATA" -mindepth 1 -maxdepth 1 -exec rm -r -f -- {} +
-        find "$ROLLBACK/data" -mindepth 1 -maxdepth 1 -exec mv -t "$DATA" -- {} +
-        [[ -f "$ROLLBACK/config" ]] && cp -a "$ROLLBACK/config" "$CONF"
-        [[ -f "$ROLLBACK/teleport.yaml" ]] && cp -a "$ROLLBACK/teleport.yaml" "$YAML"
-        # The restored registration has its own identity; the new secret goes.
-        rm -f -- "$REG_SECRET"
-        systemctl start teleport.service
-        rm -r -f -- "$ROLLBACK"
+        restore_rollback
         die "join не удался, прежняя регистрация восстановлена — journalctl -u teleport"
     fi
     rm -r -f -- "$ROLLBACK"
-    die "регистрация не подтвердилась за ${JOIN_TIMEOUT} с; агент продолжает попытки — journalctl -u teleport -f"
+    # The agent keeps trying on its own; the retry units watch it for a
+    # refusal and finish the registration (scrub, enable) when it comes.
+    join_defer "$ATTEMPT_ERROR"
+    log "$ATTEMPT_ERROR — агент продолжает попытки, повтор включён. Ход — bisquite-teleport status, journalctl -u teleport -f"
+    return 0
+}
+
+# One tick of bisquite-teleport-join.{service,timer}: retry a join that waits
+# for the network. 0 — registered or still waiting (the next tick retries);
+# 1 — the cluster refused (no more retries).
+cmd_join_retry(){
+    need_root
+    join_lock nowait || { log "идёт другой join — пропускаю тик"; return 0; }
+    load_conf
+    if [[ ! -f "$JOIN_PENDING" ]]; then
+        log "ждущего подключения нет — повторы выключаю"
+        if has_systemd; then
+            systemctl disable "$JOIN_SERVICE" >/dev/null 2>&1 || true
+            systemctl disable --now "$JOIN_TIMER" >/dev/null 2>&1 || true
+        fi
+        return 0
+    fi
+    if joined; then
+        scrub_token
+        join_settle
+        log "нода $(nodename 2>/dev/null || echo '?') зарегистрирована в ${C[TELEPORT_PROXY]} — повторы выключены"
+        return 0
+    fi
+    if [[ -z "${C[TELEPORT_PROXY]}" ]]; then
+        join_refuse "кластер не задан (TELEPORT_PROXY пуст)" ""
+        die "кластер не задан — повторять нечего; выполните bisquite-teleport join заново"
+    fi
+    if [[ "${C[TELEPORT_JOIN_METHOD]}" == bound_keypair && ! -s "$REG_SECRET" ]]; then
+        join_refuse "секрета регистрации на машине нет" ""
+        die "секрета регистрации нет — повторять нечем: $JOIN_HINT"
+    fi
+    local proxy server prc=0 agent mismatch
+    proxy="$(proxy_with_port "${C[TELEPORT_PROXY]}")"
+    server="$(probe_proxy "$proxy")" || prc=$?
+    if (( prc )); then
+        join_wait_record "прокси $proxy недоступен: $(net_reason "$prc")"
+        log "прокси $proxy недоступен ($(net_reason "$prc")) — повтор на следующем тике (попыток: $((PEND_ATTEMPTS + 1)))"
+        return 0
+    fi
+    agent="$(version_of_agent)"
+    if [[ -n "$server" && -n "$agent" ]] && mismatch="$(version_mismatch "$agent" "$server")"; then
+        # Not final: the cluster or the image may be updated.
+        join_wait_record "$mismatch"
+        log "ОШИБКА: $mismatch — повтор на следующем тике"
+        return 0
+    fi
+    attempt_register
+    case $? in
+        0)
+            scrub_token
+            join_settle
+            log "нода $(nodename) зарегистрирована в ${C[TELEPORT_PROXY]} — секрет стёрт, повторы выключены"
+            return 0 ;;
+        1)
+            join_refuse "$REFUSAL" "$REFUSAL_DETAIL"
+            log "ответ агента: ${REFUSAL_DETAIL:-—}"
+            die "кластер отказал в регистрации: $REFUSAL. Повторов не будет: $JOIN_HINT" ;;
+    esac
+    join_wait_record "$ATTEMPT_ERROR"
+    log "$ATTEMPT_ERROR — повтор на следующем тике"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1184,14 +1495,40 @@ cmd_leave(){
     [[ -d "$DATA" ]] && find "$DATA" -mindepth 1 -maxdepth 1 -exec rm -r -f -- {} +
     rm -f "$YAML"
     rm -r -f -- "$ROLLBACK"
-    rm -f -- "$REG_SECRET"
-    # Labels from the portal belong to this registration too.
+    rm -f -- "$REG_SECRET" "$JOIN_PENDING" "$JOIN_REFUSED"
+    # Labels from the portal and the join retries belong to this registration too.
     if has_systemd; then
         systemctl disable --now "$LABELS_TIMER" >/dev/null 2>&1 || true
+        systemctl disable "$JOIN_SERVICE" >/dev/null 2>&1 || true
+        systemctl disable --now "$JOIN_TIMER" >/dev/null 2>&1 || true
     fi
     rm -f -- "$LABELS_TOKEN" "$LABELS_EXPECTED" "$LABELS_APPLIED" "$LABELS_PENDING" "$LABELS_ATTEMPTS"
     save_conf TELEPORT_PROXY= TELEPORT_TOKEN= TELEPORT_CA_PIN= TELEPORT_JOIN_METHOD=token TELEPORT_LABELS_URL=
     log "отключено: агент выключен, состояние стёрто. Запись ноды в кластере исчезнет по истечении heartbeat или удаляется в админке."
+}
+
+fmt_time(){ date -d "@$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '%s' "$1"; }
+
+# Registered / refused / waiting for the network / not registered.
+join_status(){
+    if joined; then
+        echo "Регистрация: есть (host_uuid $(cat "$DATA/host_uuid"))"
+        if [[ -f "$JOIN_PENDING" ]]; then
+            echo "  повторы ещё включены — выключит ближайший тик (bisquite-teleport join-retry)"
+        fi
+    elif read_refused; then
+        echo "Регистрация: отказ кластера — ${REF_REASON:-причина не записана}${REF_AT:+ ($(fmt_time "$REF_AT"))}"
+        [[ -n "$REF_DETAIL" ]] && echo "  ответ агента: $REF_DETAIL"
+        echo "  повторов нет: $JOIN_HINT"
+    elif read_pending; then
+        echo "Регистрация: ждёт сети — попыток ${PEND_ATTEMPTS}${PEND_SINCE:+ с $(fmt_time "$PEND_SINCE")}"
+        echo "  последняя попытка: ${PEND_LAST:+$(fmt_time "$PEND_LAST") — }${PEND_ERROR:-—}"
+        if has_systemd; then
+            echo "  повтор: при загрузке и раз в минуту ($JOIN_TIMER: $(systemctl is-active "$JOIN_TIMER" 2>/dev/null))"
+        fi
+    else
+        echo "Регистрация: нет"
+    fi
 }
 
 cmd_status(){
@@ -1209,12 +1546,14 @@ cmd_status(){
     if has_systemd; then
         echo "Служба teleport: $(systemctl is-active teleport.service 2>/dev/null), $(systemctl is-enabled teleport.service 2>/dev/null)"
     fi
-    if joined; then echo "Регистрация: есть (host_uuid $(cat "$DATA/host_uuid"))"; else echo "Регистрация: нет"; fi
+    join_status
     if [[ "${C[TELEPORT_JOIN_METHOD]}" == bound_keypair ]]; then
         if [[ -s "$REG_SECRET" ]]; then
             echo "Секрет регистрации: задан (стирается после регистрации)"
-        else
+        elif joined; then
             echo "Секрет регистрации: нет — подключения идут по связанному ключу в $DATA"
+        else
+            echo "Секрет регистрации: нет"
         fi
     fi
     app_role_missing && echo "ВНИМАНИЕ: $APP_ROLE_HINT"
@@ -1267,7 +1606,12 @@ case "${1:-}" in
     status) cmd_status ;;
     render) cmd_render ;;
     apply) shift; cmd_apply "$@" ;;
-    scrub-token) need_root; scrub_token ;;
+    # The token path unit: the agent registered — on its own, too, while the
+    # join waited for the network; then the retries end here as well.
+    scrub-token)
+        need_root; scrub_token
+        if joined && [[ -f "$JOIN_PENDING" ]]; then join_settle; fi ;;
+    join-retry) cmd_join_retry ;;
     os-logins) cmd_os_logins; exit 0 ;;
     set-managed) shift; cmd_set_managed "$@" ;;
     pull) cmd_pull ;;
@@ -1275,5 +1619,5 @@ case "${1:-}" in
     # VERSION is written next to this script by the package build.
     version|--version) cat "$SELF_DIR/VERSION" 2>/dev/null || echo dev ;;
     -h|--help|help|"") sed -n '2,${/^#/!q; s/^# \{0,1\}//; p}' "$0" ;;
-    *) die "неизвестная команда '$1' (join|set|leave|status|render|apply|os-logins|set-managed|pull|labels-enable|version)" ;;
+    *) die "неизвестная команда '$1' (join|set|leave|status|render|apply|os-logins|set-managed|pull|labels-enable|join-retry|version)" ;;
 esac
