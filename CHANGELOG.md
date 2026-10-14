@@ -4,6 +4,14 @@
 release-please из Conventional Commits; 3.0.1 и старше написаны вручную в
 формате [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/).
 
+## [3.1.0](https://github.com/iamletenkov/bisquite-teleport-agent/compare/v3.0.1...v3.1.0) (2026-10-14)
+
+
+### Добавлено
+
+* join waits for the network at first boot and retries until registered ([e6a4850](https://github.com/iamletenkov/bisquite-teleport-agent/commit/e6a48506e8546cb6ae8f66906853fcff46cec168))
+* join waits for the network at first boot and retries until registered ([44cb683](https://github.com/iamletenkov/bisquite-teleport-agent/commit/44cb68355d38b25a3ad815ca9e2fbfc6f8a2102b))
+
 ## [3.0.1] — 2026-10-07
 
 ### Добавлено
