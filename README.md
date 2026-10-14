@@ -166,6 +166,7 @@ bisquite-teleport status            что настроено и что опуб
 bisquite-teleport labels-enable URL=…    метки с портала: токен со stdin, таймер
 bisquite-teleport pull              один тик: забрать метки и применить (зовёт таймер)
 bisquite-teleport set-managed env=… space=…   метки портала одним перезапуском
+bisquite-teleport join-retry        один тик повтора join, ждущего сети (зовёт таймер)
 bisquite-teleport version           версия пакета
 ```
 
@@ -193,12 +194,97 @@ bisquite-teleport version           версия пакета
    проверкой TLS, версия агента против `server_version`; для `bound_keypair` —
    агент не ниже 18.8.0 и секрет задан. Если машина была зарегистрирована,
    недоступный прокси — отказ, прежнее подключение цело. Если не была (сети
-   ещё нет) — предупреждение: агент стартует и повторяет попытки сам.
+   ещё нет) — параметры и секрет сохраняются, включаются повторы, код 0 —
+   см. [Первая загрузка без сети](#первая-загрузка-без-сети).
 3. Прежнее состояние — в `/var/lib/bisquite/teleport/rollback`, чистый
    `/var/lib/teleport` (кешированная CA прежнего кластера иначе даёт
    `no authorities for hostname`), конфиг, старт.
-4. Ждёт `host_uuid` до 120 с (`BISQUITE_TELEPORT_JOIN_TIMEOUT`). Не дождался,
-   а прежняя регистрация была — **возвращает её** и завершается ошибкой.
+4. Ждёт `host_uuid` до 120 с (`BISQUITE_TELEPORT_JOIN_TIMEOUT`) и читает
+   журнал агента. Отказ кластера — код 1, повторов нет. Не дождался, а прежняя
+   регистрация была — **возвращает её** и завершается ошибкой; не было —
+   агент продолжает попытки, включаются повторы, код 0.
+
+Одновременно идёт один `join`: ручной запуск, строка первой загрузки и тик
+повтора берут блокировку `/var/lib/bisquite/teleport/.join.lock` (тик при
+занятой — пропускается, `join` ждёт её до 3 минут).
+
+### Первая загрузка без сети
+
+Строка подключения из карточки робота Stvor исполняется в первую загрузку,
+когда сети или прокси может ещё не быть:
+
+```bash
+printf %s '<секрет>' | bisquite-teleport join TELEPORT_PROXY=… TELEPORT_JOIN_METHOD=bound_keypair \
+    TELEPORT_TOKEN=… TELEPORT_REGISTRATION_SECRET=- TELEPORT_ENV=… TELEPORT_NODENAME=… TELEPORT_LABELS=space=…
+```
+
+`join` различает «ещё нет» и «нет»:
+
+| Что | Как узнаёт | Что делает | Код |
+|---|---|---|---|
+| Сеть или прокси недоступны | `https://<прокси>/webapi/find` не ответил: DNS (curl 5/6), соединение (7), таймаут (28), TLS (35, 60 и др. — часы новой машины ещё не сверены), ошибка HTTP балансировщика (22) | сохраняет параметры и секрет, включает повторы, агент не стартует | 0 |
+| Прокси отвечает, регистрация не подтвердилась за 120 с, отказа в журнале нет | `host_uuid` не появился | агент работает и пробует сам, повторы включены и следят за ним | 0 |
+| Отказ кластера | строка в журнале `teleport.service` с начала попытки (ниже) | агент выключен, секрет стёрт, причина записана, повторов нет | 1 |
+| Зарегистрирован | `/var/lib/teleport/host_uuid` | секрет стёрт, `teleport.service` включён, повторы выключены | 0 |
+
+**Как отличить отказ от сети.** Служба join Teleport 18 (`lib/join`) отдаёт
+агенту текст отказа, и агент пишет его в журнал на каждой попытке (не реже
+раза в 90 с): `Failed to establish connection to cluster. … error:[…]` или
+`Can not join the cluster, the token is expired or not found`. Сетевые ошибки
+там другие — `connection refused`, `no such host`, `i/o timeout`, TLS — и
+отказом не считаются. Отказ — только эти тексты:
+
+| Текст агента | Причина в `status` |
+|---|---|
+| `a valid registration secret is required` | секрет неверен **или истёк** (`must_register_before`) — кластер нарочно не различает |
+| `token expired or not found` | токена нет или он истёк: робот удалён на портале или секрет перевыпущен |
+| `no recovery attempts remaining`, `failed to complete challenge`, `invalid challenge document`, `join state verification failed` | токен уже использован: ключ связан с другой машиной (робот подключён) или потерян |
+| `does not allow role`, ``is not for `bound_keypair` method``, `ambiguous token name`, `bad backend state` | токен не подходит этой машине |
+
+Неизвестный текст — не отказ: машина продолжает ждать (последняя строка
+агента видна в `status`). Ложный «отказ» оставил бы робота без связи до
+приезда человека, лишний повтор стоит одного запроса раз в минуту.
+
+**Где что лежит, пока ждёт.** Параметры — в `/etc/bisquite/teleport/config`
+(0600), секрет — в `/var/lib/bisquite/teleport/registration-secret` (0600,
+каталог 0700), ход повторов — `/var/lib/bisquite/teleport/join-pending`
+(0600: `since`, `attempts`, `last`, `error`; секрета там нет).
+
+**Повторы.** `bisquite-teleport-join.service` (oneshot, `After=` и
+`Wants=network-online.target`, `ConditionPathExists=…/join-pending`) включён в
+`multi-user.target` — запускается в каждую загрузку после сети;
+`bisquite-teleport-join.timer` — раз в минуту (`OnCalendar=minutely`, разброс
+до 30 с). Тик (`join-retry`): уже зарегистрирован — стирает секрет и
+выключает повторы, ничего не перезапуская; прокси недоступен — +1 попытка и
+выход 0; отвечает — стартует агента (если он не работает) и ждёт до 120 с
+регистрации или отказа. Агент, зарегистрировавшийся сам между тиками,
+заканчивает повторы и через `bisquite-teleport-token.path`.
+
+**Отказ.** `/var/lib/bisquite/teleport/join-refused` (0600: `at`, `reason`,
+`detail` — строка агента), `teleport.service` выключен (иначе он повторял бы
+отказ вечно), секрет стёрт — он либо истрачен, либо неверен.
+
+**Секрет истёк или отказ — что делать.** В карточке робота Stvor выдать
+новый секрет («Новый секрет») и выполнить новую строку подключения на
+машине — в терминале или через RustDesk (`sudo` перед `bisquite-teleport`,
+если не от root). Новый `join` снимает и ожидание, и отказ. Если робот уже
+был подключён с другой машины (ключ связан), Stvor добавляет к строке
+`TELEPORT_FORCE=1` для нового поколения секрета.
+
+`status`:
+
+```
+Регистрация: ждёт сети — попыток 4 с 2026-10-14 09:12:03
+  последняя попытка: 2026-10-14 09:15:31 — прокси teleport.example.org:443 недоступен: имя не разрешается — DNS (curl 6)
+  повтор: при загрузке и раз в минуту (bisquite-teleport-join.timer: active)
+
+Регистрация: отказ кластера — секрет регистрации неверен или истёк (2026-10-14 09:20:44)
+  ответ агента: ERRO Failed to establish connection to cluster. … a valid registration secret is required
+  повторов нет: новый секрет — в карточке робота Stvor («Новый секрет»), затем выполните строку подключения снова (вручную или через RustDesk)
+```
+
+Без systemd (сборка образа, chroot) `join` только пишет конфиг, как и раньше:
+агент стартует при загрузке.
 
 ### set
 
@@ -217,8 +303,9 @@ bisquite-teleport version           версия пакета
 
 ### leave
 
-Выключает агент и таймер меток, стирает `/var/lib/teleport`,
-`teleport.yaml`, токены, токен меток и состояние меток. Запись ноды в
+Выключает агент, таймер меток и повторы join, стирает `/var/lib/teleport`,
+`teleport.yaml`, токены, секрет регистрации, токен меток, состояние меток и
+ожидание или отказ join. Запись ноды в
 кластере сама не удаляется — у ноды нет на это прав; она исчезнет по
 истечении heartbeat.
 
@@ -334,21 +421,23 @@ ICON=laptop
 | `/usr/local/bin/teleport` | 0755 | агент Teleport — ставится отдельно |
 | `/usr/sbin/bisquite-teleport` | ссылка | CLI → `/usr/lib/bisquite-teleport/bisquite-teleport` |
 | `/usr/lib/bisquite-teleport/` | | CLI, схема `knobs`, хук `knobs.apply`, `lib/bisquite-conf`, `pkg-setup` |
-| `/usr/lib/systemd/system/` | | `teleport.service`, `bisquite-teleport-{apps,token}.{path,service}`, `bisquite-teleport-labels.{service,timer}` |
+| `/usr/lib/systemd/system/` | | `teleport.service`, `bisquite-teleport-{apps,token}.{path,service}`, `bisquite-teleport-labels.{service,timer}`, `bisquite-teleport-join.{service,timer}` |
 | `/opt/bisquite/knobs/teleport{,.apply}` | ссылки | схема и хук — там их ищет `bisquite-conf` |
 | `/etc/bisquite/teleport/config` | 0600 | ручки (`bisquite-conf show teleport`) |
 | `/etc/bisquite/teleport/apps.d/` | 0755 | объявления приложений |
 | `/etc/bisquite/teleport/labels-token` | 0600 | `url=…` и `token=…` меток портала |
 | `/etc/teleport.yaml` | 0600 | генерируется |
 | `/var/lib/teleport/` | 0750 | регистрация агента; у `bound_keypair` — и связанный ключ |
-| `/var/lib/bisquite/teleport/` | 0700 | `rollback`, секрет регистрации до регистрации, состояние меток, `2.x-units/` |
+| `/var/lib/bisquite/teleport/` | 0700 | `rollback`, секрет регистрации до регистрации, `join-pending` / `join-refused` (0600), состояние меток, `2.x-units/` |
 
-Юниты: `teleport.service` включает `join`; path-юниты включены всегда (до
-регистрации ничего не делают); таймер меток включает `labels-enable`.
+Юниты: `teleport.service` включает `join` после регистрации; path-юниты
+включены всегда (до регистрации ничего не делают); таймер меток включает
+`labels-enable`; `bisquite-teleport-join.{service,timer}` включает `join`,
+ждущий сети, и выключает первая успешная регистрация или отказ.
 
 ## Удаление
 
-`apt remove` останавливает таймер меток и path-юниты, но не агент: удаление
+`apt remove` останавливает таймеры меток и повтора join и path-юниты, но не агент: удаление
 не должно рвать сессию, из которой его запустили. Ни `remove`, ни `purge`
 **не стирают регистрацию**: `/var/lib/teleport`, `/etc/bisquite/teleport` и
 `/etc/teleport.yaml` остаются. Отключить машину — `sudo bisquite-teleport
@@ -360,6 +449,7 @@ leave` **до** удаления пакета.
 sudo bisquite-teleport status
 journalctl -u teleport -f
 journalctl -u bisquite-teleport-labels   # тики меток: ни токена, ни тела ответа там нет
+journalctl -u bisquite-teleport-join     # тики повтора join: попытка, причина ожидания или отказа
 ```
 
 ## Разработка
@@ -370,7 +460,9 @@ make deb       # dist/bisquite-teleport-agent_<версия>_all.deb и dist/SHA
 ```
 
 Тесты идут на подменённом корне (`BISQUITE_TELEPORT_ROOT`) с поддельными
-`systemctl`, `curl`, `dpkg` и `teleport`: root, systemd и сеть не нужны.
+`systemctl`, `journalctl`, `curl`, `dpkg` и `teleport`: root, systemd и сеть
+не нужны. `tests/test-join.sh` — первая загрузка без сети: разбор ошибок,
+файлы 0600, стирание секрета, тик повтора, идемпотентность, блокировка.
 Сборка `.deb` — `dpkg-deb` без debhelper, воспроизводимая
 (`SOURCE_DATE_EPOCH` — время последнего коммита).
 

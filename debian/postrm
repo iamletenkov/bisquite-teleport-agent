@@ -11,7 +11,8 @@ R="${BISQUITE_TELEPORT_ROOT:-}"
 PKG=/usr/lib/bisquite-teleport
 UNITS="teleport.service bisquite-teleport-apps.path bisquite-teleport-apps.service
 bisquite-teleport-token.path bisquite-teleport-token.service
-bisquite-teleport-labels.service bisquite-teleport-labels.timer"
+bisquite-teleport-labels.service bisquite-teleport-labels.timer
+bisquite-teleport-join.service bisquite-teleport-join.timer"
 
 # unlink_if <link> <target prefix>
 unlink_if(){

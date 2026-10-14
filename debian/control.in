@@ -13,6 +13,8 @@ Description: Teleport node agent: SSH node, web apps, portal labels
  and publishes its loopback web apps (declarations in
  /etc/bisquite/teleport/apps.d). It renders /etc/teleport.yaml from
  /etc/bisquite/teleport/config, scrubs the join token after registration,
+ retries a first-boot join until the network and the proxy are up (a
+ refusal of the cluster is not retried),
  publishes the os_logins label and can take the space and env labels from
  a portal implementing GET /robot-api/v1/labels.
  .
