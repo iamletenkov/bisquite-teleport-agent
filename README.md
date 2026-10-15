@@ -479,6 +479,8 @@ make deb       # dist/bisquite-teleport-agent_<версия>_all.deb и dist/SHA
 1. Сливаешь в `main` коммиты по [Conventional Commits](https://www.conventionalcommits.org/ru/):
    `fix:` поднимает patch, `feat:` — minor, `!` или `BREAKING CHANGE:` — major;
    `docs:`, `ci:`, `chore:` версию не трогают.
+   Тип и область — латиницей, текст заголовка и тела — на русском
+   (`feat(rustdesk): пакет для arm64`); подробнее — [CLAUDE.md](CLAUDE.md).
 2. После проверок на `main` release-please открывает (и дальше обновляет)
    PR «chore(main): release X.Y.Z» — он поднимает `VERSION` и дописывает
    секцию в `CHANGELOG.md`.
