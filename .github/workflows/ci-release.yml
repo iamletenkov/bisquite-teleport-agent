@@ -7,7 +7,8 @@ name: CI and Release
 # Выпуск — release-please, как в bisquite: на main после проверок он ведёт
 # PR «release X.Y.Z» (VERSION и CHANGELOG.md); слияние этого PR создаёт тег
 # vX.Y.Z и ОПУБЛИКОВАННЫЙ релиз, после чего job release-artifacts собирает из
-# тега .deb и SHA256SUMS и прикладывает их к релизу. Теги руками не ставят.
+# тега .deb и SHA256SUMS и прикладывает их к релизу, а dispatch-extensions
+# запускает в bisquite-extensions подъём пина агента. Теги руками не ставят.
 #
 # Повторно собрать и приложить файлы к уже опубликованному релизу — ручной
 # запуск с входом release_tag (Actions → CI and Release → Run workflow).
