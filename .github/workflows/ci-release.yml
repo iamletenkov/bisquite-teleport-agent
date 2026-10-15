@@ -12,11 +12,14 @@ name: CI and Release
 # Повторно собрать и приложить файлы к уже опубликованному релизу — ручной
 # запуск с входом release_tag (Actions → CI and Release → Run workflow).
 
+# Ветки проверяются на pull_request (результат слияния с main), push — только
+# main: там релиз. push во все ветки вместе с pull_request гонял CI дважды на
+# каждый коммит PR. Ветку без PR — черновым PR или вручную (workflow_dispatch).
 on:
   pull_request:
     branches: [main]
   push:
-    branches: ["**"]
+    branches: [main]
   workflow_dispatch:
     inputs:
       release_tag:
