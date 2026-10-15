@@ -488,6 +488,13 @@ make deb       # dist/bisquite-teleport-agent_<версия>_all.deb и dist/SHA
    опубликованный релиз с заметками из секции, затем job
    `release-artifacts` собирает из тега `.deb` и `SHA256SUMS` и прикладывает
    их к релизу.
+4. После файлов job `dispatch-extensions` запускает в `iamletenkov/bisquite-extensions`
+   workflow `agent-bump.yml`: тот открывает PR с пином агента в расширении
+   `teleport-agent` (версия и sha256 из `SHA256SUMS`), слияние выпускает
+   расширения, а их релиз сам поднимает их в `bisquite`. Токен — секрет
+   `EXTENSIONS_DISPATCH_TOKEN` этого репозитория: fine-grained PAT только на
+   bisquite-extensions с правом Actions: Read and write, действует до 16.10.2027 —
+   до этой даты перевыпустить, иначе job релиза покраснеет.
 
 Теги руками не ставят. Если сборка файлов упала, релиз уже виден без них:
 «Re-run failed jobs» в том же прогоне или ручной запуск с `release_tag`:
@@ -495,6 +502,9 @@ make deb       # dist/bisquite-teleport-agent_<версия>_all.deb и dist/SHA
 ```bash
 gh workflow run ci-release.yml --ref main -f release_tag=vX.Y.Z
 ```
+
+Такой запуск после файлов тоже дёргает `agent-bump.yml`: он идемпотентен — пин уже
+на версии, PR на неё открыт или релиз старше пина — нового PR не будет.
 
 ## Лицензия
 
